@@ -7,11 +7,13 @@ import re
 import json
 import os
 import webbrowser
+from PIL import Image, ImageTk
+import customtkinter # Ensure this is already there
 
 class App(customtkinter.CTk):
     def __init__(self):
         super().__init__()
-        self.title("YouTube Sentiment Analyzer")
+        self.title("Political Sentiment Analyzer (Youtube Channel)")
         self.geometry("800x900")
 
         self.log_queue = queue.Queue()
@@ -25,7 +27,7 @@ class App(customtkinter.CTk):
         input_frame.pack(pady=10, padx=20, fill="x")
 
         # API Key and Channel ID inputs
-        youtube_api_key_label = CTkLabel(input_frame, text="YouTube API Key:")
+        youtube_api_key_label = CTkLabel(input_frame, text="YouTube Data API Key:")
         youtube_api_key_label.pack(pady=(5, 2), anchor="w")
         self.youtube_api_key_entry = CTkEntry(input_frame, placeholder_text="Enter YouTube API Key")
         self.youtube_api_key_entry.pack(pady=(0, 5), fill="x")
@@ -41,7 +43,7 @@ class App(customtkinter.CTk):
         self.channel_id_entry.pack(pady=(0, 5), fill="x")
 
         api_key_guidance_label = CTkLabel(input_frame,
-                                          text="Leave API key fields blank to use keys from .env file (if scraper_v2.py is configured for it).",
+                                          text="Leave API key fields blank to use keys from .env file.",
                                           font=customtkinter.CTkFont(size=10),
                                           text_color="gray")
         api_key_guidance_label.pack(pady=(0, 10), anchor="w")
@@ -76,12 +78,35 @@ class App(customtkinter.CTk):
         self.tab_view.pack(pady=10, padx=20, fill="both", expand=True)
         self.tab_view.add("Log")
         self.tab_view.add("Overall Summary")
-        self.tab_view.add("Individual Video Results")
+        self.tab_view.add("Individual Video Results") # Already there
 
+        # Setup content for Log tab
         self.log_display = CTkTextbox(self.tab_view.tab("Log"), state='disabled', wrap='word')
         self.log_display.pack(pady=5, padx=5, fill='both', expand=True)
-        self.overall_summary_display = CTkTextbox(self.tab_view.tab("Overall Summary"), state='disabled', wrap='word')
-        self.overall_summary_display.pack(pady=5, padx=5, fill='both', expand=True)
+
+        # New structure for "Overall Summary" tab
+        self.overall_summary_tab_frame = customtkinter.CTkScrollableFrame(
+                    self.tab_view.tab("Overall Summary"), 
+                    fg_color="transparent"
+                    # You can also customize scrollbar colors here if needed, e.g.:
+                    # scrollbar_button_color="#C0C0C0", 
+                    # scrollbar_button_hover_color="#A0A0A0"
+                )        
+        self.overall_summary_tab_frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+        self.overall_summary_tab_frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+        # The plot_image_label and overall_summary_display will now be children of this scrollable frame
+        self.plot_image_label = customtkinter.CTkLabel(self.overall_summary_tab_frame, text="Sentiment plot will appear here after analysis.")
+        # Pack the image label. It will determine its own size based on the image.
+        # Horizontal fill/expand is usually not needed for the label itself if the image is pre-scaled.
+        self.plot_image_label.pack(pady=(5, 10), padx=5) 
+
+        self.overall_summary_display = CTkTextbox(self.overall_summary_tab_frame, state='disabled', wrap='word', height=200) # Keep a reasonable default height
+        # The textbox will fill available width and expand vertically if there's space *after* the image,
+        # or contribute to the scrollable height.
+        self.overall_summary_display.pack(pady=(0, 5), padx=5, fill="both", expand=True)
+    
         self.individual_results_frame = CTkScrollableFrame(self.tab_view.tab("Individual Video Results"))
         self.individual_results_frame.pack(pady=5, padx=5, fill='both', expand=True)
         
@@ -362,58 +387,124 @@ class App(customtkinter.CTk):
 
     def _display_analysis_results(self):
         self.log_queue.put("Populating result tabs...\n")
-        self.tab_view.set("Overall Summary")
+        self.tab_view.set("Overall Summary") # Switch to the Overall Summary tab
 
+        # --- 1. Populate the JSON Summary Textbox ---
         self.overall_summary_display.configure(state='normal')
         self.overall_summary_display.delete("1.0", customtkinter.END)
         
-        visual_summary_path = os.path.join(self.analysis_output_dir, "overall_sentiment_visual.txt")
         summary_json_path = os.path.join(self.analysis_output_dir, "overall_sentiment_summary.json")
-
-        if os.path.exists(visual_summary_path):
-            try:
-                with open(visual_summary_path, 'r', encoding='utf-8') as f: visual_content = f.read()
-                self.overall_summary_display.insert(customtkinter.END, "--- Overall Sentiment Visual ---\n" + visual_content + "\n\n")
-            except Exception as e: self.log_queue.put(f"Error reading visual summary: {str(e)}\n")
-        else:
-            self.log_queue.put(f"Visual summary not found: {visual_summary_path}\n")
-            self.overall_summary_display.insert(customtkinter.END, "Visual summary file not found.\n\n")
 
         if os.path.exists(summary_json_path):
             try:
-                with open(summary_json_path, 'r', encoding='utf-8') as f: json_data = json.load(f)
-                summary_text = "--- Overall Sentiment JSON Summary ---\n"
+                with open(summary_json_path, 'r', encoding='utf-8') as f:
+                    json_data = json.load(f)
+                
+                summary_text = "--- Overall Sentiment JSON Summary ---\n\n"
                 if 'overall_stats' in json_data:
                     summary_text += f"Total Analyzed Comments: {json_data['overall_stats'].get('valid_analyses', 0)}\n"
                     summary_text += f"Total Sarcastic Comments: {json_data['overall_stats'].get('total_sarcastic_comments_overall', 0)}\n\n"
+                
                 if 'by_entity' in json_data:
+                    entities_found = False
                     for entity, data in json_data['by_entity'].items():
                         if data.get("comment_count", 0) > 0: # Only display if there are comments for the entity
+                            entities_found = True
                             summary_text += f"Entity: {entity} ({data['comment_count']} comments)\n"
-                            summary_text += f"  Positive: {data['positive']}, Negative: {data['negative']}, Neutral: {data['neutral']}\n"
-                            summary_text += f"  Sarcastic: {data['sarcastic_count']}\n"
+                            summary_text += f"  Positive: {data.get('positive', 0)}, Negative: {data.get('negative', 0)}, Neutral: {data.get('neutral', 0)}\n"
+                            summary_text += f"  Sarcastic: {data.get('sarcastic_count', 0)}\n"
                             avg_score = data.get('average_sentiment_score', 0.0)
-                            summary_text += f"  Avg Score: {avg_score:.2f}\n\n"
+                            summary_text += f"  Avg Score: {avg_score:.2f} (from {data.get('valid_score_count',0)} scored comments)\n\n"
+                    if not entities_found:
+                        summary_text += "No specific entities had comments attributed to them in this analysis.\n\n"
+                else:
+                    summary_text += "No 'by_entity' data found in summary.\n\n"
+                    
                 self.overall_summary_display.insert(customtkinter.END, summary_text)
             except Exception as e:
-                self.log_queue.put(f"Error reading/parsing JSON summary: {str(e)}\n")
-                self.overall_summary_display.insert(customtkinter.END, "Error reading or parsing JSON summary.\n")
+                error_message = f"Error reading/parsing JSON summary: {str(e)}\n"
+                self.log_queue.put(error_message)
+                self.overall_summary_display.insert(customtkinter.END, error_message)
         else:
-            self.log_queue.put(f"JSON summary not found: {summary_json_path}\n")
-            self.overall_summary_display.insert(customtkinter.END, "JSON summary file not found.\n")
+            not_found_message = f"JSON summary file not found: {summary_json_path}\n"
+            self.log_queue.put(not_found_message)
+            self.overall_summary_display.insert(customtkinter.END, not_found_message)
         self.overall_summary_display.configure(state='disabled')
 
-        for widget in self.individual_results_frame.winfo_children(): widget.destroy()
-        if not self.selected_videos_for_analysis_cache: # Check if cache from current run is empty
-             CTkLabel(self.individual_results_frame, text="No videos were selected for this analysis run.").pack(pady=10)
+        # --- 2. Display the Sentiment Plot Image ---
+        plot_image_path = os.path.join(self.analysis_output_dir, "overall_sentiment_plot.png")
+
+        if os.path.exists(plot_image_path):
+            try:
+                original_image = Image.open(plot_image_path)
+                img_width, img_height = original_image.size
+
+                # Determine a sensible display width for the image.
+                # Try to make it fit the width of the scrollable frame's content area.
+                # This can be a bit tricky as winfo_width() might not be perfectly accurate
+                # before the GUI is fully idle. A practical approach is often needed.
+                
+                # Ensure the frame has had a chance to determine its size.
+                self.overall_summary_tab_frame.update_idletasks() 
+                available_width = self.overall_summary_tab_frame.winfo_width()
+                
+                # Subtract some padding and approximate scrollbar width
+                max_display_width = available_width - 30 if available_width > 50 else 700 # Fallback if width is too small initially
+
+                display_width = img_width
+                display_height = img_height
+
+                if img_width > max_display_width:
+                    # Scale image to fit max_display_width while maintaining aspect ratio
+                    ratio = max_display_width / float(img_width)
+                    display_width = max_display_width
+                    display_height = int(img_height * ratio)
+                # else: image is already narrower than our max, use its original dimensions (or scaled if height was also capped previously)
+
+                # Ensure dimensions are positive
+                display_width = max(1, display_width)
+                display_height = max(1, display_height)
+
+                # Resize the PIL image before creating CTkImage
+                # Using Resampling.LANCZOS for better quality downscaling
+                resized_image = original_image.resize((display_width, display_height), Image.Resampling.LANCZOS)
+                
+                ctk_img = customtkinter.CTkImage(light_image=resized_image,
+                                                 dark_image=resized_image, 
+                                                 size=(display_width, display_height))
+                
+                self.plot_image_label.configure(image=ctk_img, text="") # Set image, clear placeholder
+                self.plot_image_label.image = ctk_img # Keep a reference (good practice)
+                self.log_queue.put("Sentiment plot displayed.\n")
+
+            except Exception as e:
+                error_message_plot = f"Error displaying plot image: {str(e)}\n"
+                self.log_queue.put(error_message_plot)
+                self.plot_image_label.configure(image=None, text="Error displaying plot.")
+        else:
+            not_found_message_plot = f"Sentiment plot image not found: {plot_image_path}\n"
+            self.log_queue.put(not_found_message_plot)
+            self.plot_image_label.configure(image=None, text="Plot image not found.")
+            
+
+        # --- 3. Populate Individual Video Results Tab ---
+        for widget in self.individual_results_frame.winfo_children(): # Clear previous results
+            widget.destroy()
+
+        if not self.selected_videos_for_analysis_cache: # Videos selected for *this specific analysis run*
+             CTkLabel(self.individual_results_frame, text="No videos were selected for this analysis run to show individual results.").pack(pady=10)
              return
 
+        any_results_displayed = False
         for video_data in self.selected_videos_for_analysis_cache:
-            video_title = video_data['title']
-            video_id = video_data['video_id']
-            sanitized_title = self._sanitize_folder_name(video_title) # Ensure this is defined or use a simpler one
-            # Folder structure from scraper_v2.py: {output_dir}/{video_id}_{sanitized_title}
-            video_subfolder = os.path.join(self.analysis_output_dir, f"{video_id}_{sanitized_title}")
+            video_title = video_data.get('title', 'N/A')
+            video_id = video_data.get('video_id', 'N/A')
+
+            if video_id == 'N/A':
+                continue
+
+            sanitized_title_for_folder = self._sanitize_folder_name(video_title if video_title != 'N/A' else video_id)
+            video_subfolder = os.path.join(self.analysis_output_dir, f"{video_id}_{sanitized_title_for_folder}")
             
             video_frame = customtkinter.CTkFrame(self.individual_results_frame, border_width=1)
             video_frame.pack(fill="x", pady=5, padx=5)
@@ -422,27 +513,26 @@ class App(customtkinter.CTk):
             title_label = CTkLabel(video_frame, text=title_label_text, font=customtkinter.CTkFont(weight="bold"))
             title_label.pack(anchor="w", padx=5, pady=(5,2))
 
-            # Use a lambda to capture the correct folder_path for each button
             open_button = CTkButton(video_frame, text="Open Video Folder", 
                                     command=lambda folder=video_subfolder: self.open_folder_action(folder))
-            open_button.pack(anchor="e", padx=5, pady=2)
+            open_button.pack(anchor="e", padx=5, pady=2) # Changed to "e" (east/right)
             
-            # Files expected to be generated by scraper_v2.py in each video's subfolder
             files_to_check = [
                 "video_meta.json", 
                 "original_comments.json",
-                "audio_track.mp3", # If audio download was attempted
+                "audio_track.mp3",
                 "transcription.txt", 
                 "contextual_summary.txt", 
-                "targeted_sentiment_analysis.json" # Previously political_leniency_analysis.json
+                "targeted_sentiment_analysis.json"
             ]
             for file_name in files_to_check:
                 file_path = os.path.join(video_subfolder, file_name)
                 status = "Found" if os.path.exists(file_path) else "Not Found"
-                CTkLabel(video_frame, text=f"{file_name}: {status}").pack(anchor="w", padx=10)
+                CTkLabel(video_frame, text=f"  - {file_name}: {status}").pack(anchor="w", padx=10)
+            any_results_displayed = True
         
-        if not any(self.individual_results_frame.winfo_children()): # Check if any frames were actually added
-            CTkLabel(self.individual_results_frame, text="No individual results to display for the selected videos.").pack(pady=10)
+        if not any_results_displayed: # If loop was empty or all videos skipped
+            CTkLabel(self.individual_results_frame, text="No individual results to display for the processed videos.").pack(pady=10)
 
     def open_folder_action(self, folder_path): # Helper method for the button
         try:
