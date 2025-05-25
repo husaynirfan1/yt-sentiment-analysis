@@ -1001,3 +1001,137 @@ if __name__ == '__main__':
     # print(f"All data saved in subfolders within: {os.path.abspath(base_download_parent_folder)}")
     print(f"All data saved in subfolders within: {os.path.abspath(base_download_parent_folder)}")
 
+def main_cli_runner():
+    # --- Configuration ---
+    INPUT_CHANNEL_ID = ""
+    # Prompt for Channel ID if not hardcoded
+    while not INPUT_CHANNEL_ID.startswith("UC") or len(INPUT_CHANNEL_ID) < 10: # Basic validation
+        INPUT_CHANNEL_ID = input("Please enter the YouTube Channel ID (starts with UC, e.g., UCXXXX...): ").strip()
+        if not INPUT_CHANNEL_ID.startswith("UC"):
+            print("Invalid Channel ID format. It must start with 'UC'.")
+        elif len(INPUT_CHANNEL_ID) < 10: # Arbitrary minimum length, typical IDs are longer
+             print("Channel ID seems too short. Please re-enter.")
+
+
+    MAX_VIDEOS_TO_SCAN_FROM_CHANNEL = 20 # Reduced for quicker testing, adjust as needed
+    COMMENTS_TO_ANALYZE_PER_VIDEO_COUNT = 100 # Or 'all'
+
+    # --- Initial Checks ---
+    # These are global for the CLI runner, but functions should take them as params
+    if not YOUTUBE_API_KEY: print("Error: YOUTUBE_API_KEY not found in environment variables or .env file.")
+    if not FIREWORKS_API_KEY: print("Error: FIREWORKS_API_KEY not found. AI functions will be skipped or fail.")
+
+    if not YOUTUBE_API_KEY: # Fireworks key is checked within functions
+        print("Exiting due to missing YouTube API key.")
+        exit()
+
+    # --- Agent 0: Fetch & Filter Politics-Related Videos ---
+    politics_related_videos = agent0_fetch_and_filter_videos(
+        INPUT_CHANNEL_ID, YOUTUBE_API_KEY, FIREWORKS_API_KEY, MAX_VIDEOS_TO_SCAN_FROM_CHANNEL
+    )
+
+    if not politics_related_videos:
+        print("No politics-related videos found or an error occurred with Agent 0. Exiting.")
+        exit()
+
+    print("\n--- Politics-Related Videos Found by Agent 0 ---")
+    for i, video in enumerate(politics_related_videos):
+        print(f"{i+1}. {video.get('title')} (ID: {video.get('video_id')})")
+        print(f"   Reason: {video.get('reasoning_for_political', 'N/A')}")
+        print(f"   URL: {video.get('url')}")
+
+
+    # --- User Selection of Videos to Process ---
+    videos_to_process_fully = []
+    if not politics_related_videos: # Should have exited above, but defensive check
+        print("No videos to select from. Exiting.")
+        exit()
+
+    while True:
+        user_choice_str = input(f"\nEnter video number (1-{len(politics_related_videos)}) to process, "
+                                f"'all' for all {len(politics_related_videos)} listed, or 'quit': ").strip().lower()
+        if user_choice_str == 'quit':
+            print("Exiting.")
+            exit()
+        elif user_choice_str == 'all':
+            videos_to_process_fully = politics_related_videos
+            print(f"Selected all {len(videos_to_process_fully)} videos for full analysis.")
+            break
+        else:
+            try:
+                choice_index = int(user_choice_str) - 1
+                if 0 <= choice_index < len(politics_related_videos):
+                    selected_video = politics_related_videos[choice_index]
+                    videos_to_process_fully.append(selected_video)
+                    print(f"Added video: {selected_video.get('title')} to processing queue.")
+                    # Ask if user wants to add more, or process now
+                    add_more = input("Add another video? (yes/no/all/quit): ").strip().lower()
+                    if add_more == 'no' or add_more == 'quit':
+                        break
+                    elif add_more == 'all':
+                        videos_to_process_fully = politics_related_videos
+                        print(f"Selected all {len(videos_to_process_fully)} videos for full analysis.")
+                        break
+                    # If 'yes' or anything else, the loop continues to ask for another number
+                else:
+                    print(f"Invalid video number. Please enter a number between 1 and {len(politics_related_videos)}.")
+            except ValueError:
+                print("Invalid input. Please enter a number, 'all', or 'quit'.")
+
+    if not videos_to_process_fully:
+        print("No videos selected for processing. Exiting.")
+        exit()
+
+    print(f"\n--- Starting full analysis for {len(videos_to_process_fully)} selected video(s) ---")
+
+
+    # --- Main Processing Loop for Selected Videos ---
+    grand_total_analyzed_comments_data = []
+    # Define base_download_parent_folder for the CLI runner context
+    base_download_parent_folder_cli = "analysis_data_cli" 
+    os.makedirs(base_download_parent_folder_cli, exist_ok=True)
+
+
+    for video_idx, video_info_from_agent0 in enumerate(videos_to_process_fully):
+        print(f"\n\n=== CLI Processing Video {video_idx + 1}/{len(videos_to_process_fully)}: {video_info_from_agent0.get('title')} ===")
+        # Pass YOUTUBE_API_KEY and FIREWORKS_API_KEY which are in scope for main_cli_runner
+        video_processing_results = process_single_video(
+            video_info=video_info_from_agent0,
+            youtube_api_key=YOUTUBE_API_KEY, # Global for CLI context
+            fireworks_api_key=FIREWORKS_API_KEY, # Global for CLI context
+            comments_to_analyze_count=COMMENTS_TO_ANALYZE_PER_VIDEO_COUNT, # From CLI config
+            base_output_folder=base_download_parent_folder_cli # CLI specific output folder
+        )
+        if video_processing_results and video_processing_results.get("analyzed_comments"):
+            grand_total_analyzed_comments_data.extend(video_processing_results["analyzed_comments"])
+        
+        if video_idx < len(videos_to_process_fully) - 1:
+            print("--- CLI: Waiting briefly before next video ---")
+            time.sleep(5) # Brief pause between processing different videos
+
+    # --- Display Overall Sentiment Summary & Visual (after all selected videos are processed) ---
+    if grand_total_analyzed_comments_data:
+        print("\n\n========================================================")
+        print("       CLI: OVERALL COMBINED TARGETED SENTIMENT ANALYSIS RESULTS")
+        print("========================================================")
+        
+        targeted_sentiment_summary_results = calculate_targeted_sentiment_summary(
+            grand_total_analyzed_comments_data, 
+            title="CLI Grand Total (All Selected Videos) Targeted Sentiment"
+        )
+        
+        if (targeted_sentiment_summary_results and 
+            targeted_sentiment_summary_results.get("overall_stats", {}).get("valid_analyses", 0) > 0):
+            generate_and_display_targeted_sentiment_visual(targeted_sentiment_summary_results)
+        else:
+            print("\nCLI: No valid targeted sentiment data was processed to display a visual summary.")
+            
+    else:
+        print("\nCLI: No comments were analyzed across all selected videos, so no overall targeted sentiment summary to display.")
+
+    print("\nCLI: All selected videos processed. Script finished.")
+    print(f"CLI: All data saved in subfolders within: {os.path.abspath(base_download_parent_folder_cli)}")
+
+
+if __name__ == '__main__':
+    main_cli_runner()
