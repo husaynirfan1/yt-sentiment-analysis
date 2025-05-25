@@ -1,11 +1,14 @@
+#!/usr/bin/env python3
 import os
 import re
 import json
-import time # For potential rate limiting if ever needed
+import time
 import yt_dlp
 from dotenv import load_dotenv
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+import argparse # Added
+import sys # Added
 
 # Langchain and Fireworks AI specific imports
 from langchain_fireworks import ChatFireworks
@@ -19,12 +22,16 @@ import openai
 # Load environment variables from .env file
 load_dotenv()
 
-# --- API KEYS ---
-YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY")
-FIREWORKS_API_KEY = os.environ.get("FIREWORKS_API_KEY")
+# --- API KEYS (Defaults from .env, will be overridden by args if provided) ---
+_YOUTUBE_API_KEY_FROM_ENV = os.environ.get("YOUTUBE_API_KEY")
+_FIREWORKS_API_KEY_FROM_ENV = os.environ.get("FIREWORKS_API_KEY")
+
+# These will hold the effective API keys used by the script
+EFFECTIVE_YOUTUBE_API_KEY = None
+EFFECTIVE_FIREWORKS_API_KEY = None
 
 # --- FFmpeg Location (Optional) ---
-FFMPEG_LOCATION = None
+FFMPEG_LOCATION = None # You can set this directly if needed, or add as an arg
 
 # --- Malaysian Political Entities for Analysis ---
 MALAYSIAN_POLITICAL_ENTITIES = [
@@ -38,14 +45,14 @@ TARGETABLE_MALAYSIAN_POLITICAL_ENTITIES = [
     "Pakatan Harapan (PH)", "Perikatan Nasional (PN)", "Barisan Nasional (BN)",
     "Gabungan Parti Sarawak (GPS)", "Gabungan Rakyat Sabah (GRS)",
     "Malaysian United Democratic Alliance (MUDA)", "Parti Sosialis Malaysia (PSM)",
-    # We'll add a special value for the LLM to use when no specific listed entity is targeted.
     "General Comment/No Specific Listed Entity"
 ]
+
+# --- Pydantic Models (TargetedCommentSentiment, PoliticalVideoCheck, etc. - unchanged) ---
 class TargetedCommentSentiment(BaseModel):
     comment_text: str = Field(description="The original comment text.")
     is_sarcastic: bool = Field(description="True if the comment is sarcastic, False otherwise.")
     sarcasm_reasoning: str = Field(description="Brief explanation if sarcasm is detected, or 'N/A' if not sarcastic.")
-
     primary_target_entity: str = Field(
         description=(
             "The Malaysian political entity primarily targeted or discussed in the comment. "
@@ -57,7 +64,6 @@ class TargetedCommentSentiment(BaseModel):
     entity_identification_reasoning: str = Field(
         description="Brief reasoning for identifying the primary_target_entity, or for choosing 'General Comment/No Specific Listed Entity'."
     )
-
     sentiment_expressed: str = Field(
         description=(
             "The sentiment expressed towards the 'primary_target_entity'. If 'primary_target_entity' is "
@@ -80,29 +86,15 @@ class TargetedCommentSentiment(BaseModel):
         )
     )
 
-# --- Pydantic Models for LLM Outputs ---
 class PoliticalVideoCheck(BaseModel):
     is_political: bool = Field(description="True if the video is primarily about Malaysian politics, False otherwise.")
     reasoning: str = Field(description="A brief explanation for the decision.")
     video_title: str = Field(description="The original video title.")
     video_id: str = Field(description="The YouTube video ID.")
 
-class CommentLeniency(BaseModel):
-    comment_text: str = Field(description="The original comment text.")
-    is_sarcastic: bool = Field(description="True if the comment is sarcastic, False otherwise.")
-    sarcasm_reasoning: str = Field(description="Brief explanation if sarcasm is detected, or 'N/A' if not sarcastic.")
-    political_entity_lean: str = Field(description=f"The identified political entity from the list: {', '.join(MALAYSIAN_POLITICAL_ENTITIES)}. Consider sarcasm's impact.")
-    leniency_score_percent: float = Field(description="A score from 0 to 100 indicating confidence/strength of leaning (0 if Neutral/Unclear). Adjust based on sarcasm if it negates apparent leaning.")
-    reasoning: str = Field(description="A brief explanation for your political leniency judgment (1-2 sentences), factoring in any detected sarcasm.")
+# ... (CommentLeniency and CommentSentimentAnalysis models remain the same)
 
-class CommentSentimentAnalysis(BaseModel):
-    comment_text: str = Field(description="The original comment text.")
-    is_sarcastic: bool = Field(description="True if the comment is sarcastic, False otherwise.")
-    sarcasm_reasoning: str = Field(description="Brief explanation if sarcasm is detected, or 'N/A' if not sarcastic.")
-    overall_sentiment: str = Field(description="The overall sentiment of the comment. Must be one of: 'positive', 'negative', 'neutral'.")
-    sentiment_score: float = Field(description="A score from -1.0 (very negative) to 1.0 (very positive), with 0.0 representing neutral. This score should reflect the intensity of the sentiment. Sarcasm should be factored in (e.g., if sarcasm inverts an apparently positive statement to express a negative sentiment).")
-    sentiment_reasoning: str = Field(description="A brief explanation for the sentiment classification and score, explicitly mentioning how any detected sarcasm influenced the judgment.")
-# --- Helper Functions ---
+# --- Helper Functions (extract_video_id, save_data_to_file, clean_llm_json_output - largely unchanged) ---
 def extract_video_id(url):
     patterns = [
         r"(?:https?:\/\/)?(?:www\.)?youtube\.com\/shorts\/([a-zA-Z0-9_-]{11})",
@@ -113,7 +105,7 @@ def extract_video_id(url):
     for pattern in patterns:
         match = re.search(pattern, url)
         if match: return match.group(1)
-    print(f"Warning: Could not extract video ID from URL: {url}")
+    print(f"Warning: Could not extract video ID from URL: {url}", file=sys.stderr) # Print warnings/errors to stderr
     return None
 
 def save_data_to_file(data_content, output_folder_path, filename):
@@ -127,48 +119,42 @@ def save_data_to_file(data_content, output_folder_path, filename):
                 f.write(data_content)
             else:
                 json.dump(data_content, f, ensure_ascii=False, indent=4)
-        print(f"Saved {filename} to: {os.path.abspath(file_path)}")
+        print(f"Saved {filename} to: {os.path.abspath(file_path)}", file=sys.stderr)
     except Exception as e:
-        print(f"Error saving {filename} to {file_path}: {e}")
+        print(f"Error saving {filename} to {file_path}: {e}", file=sys.stderr)
 
 def clean_llm_json_output(raw_text: str) -> str:
-    """
-    Cleans potential markdown formatting around JSON output from LLMs.
-    """
     text = raw_text.strip()
     if text.startswith("```json"):
         text = text[len("```json"):]
     if text.endswith("```"):
         text = text[:-len("```")]
-    # Sometimes LLMs might add a preamble like "Here's the JSON output:"
-    # This is a basic attempt to find the start of the JSON.
-    # More robust parsing might be needed if issues persist.
     json_start_index = text.find('{')
     json_end_index = text.rfind('}')
     if json_start_index != -1 and json_end_index != -1 and json_end_index > json_start_index:
         text = text[json_start_index : json_end_index + 1]
     return text.strip()
 
-# --- YouTube API Functions ---
-def get_channel_uploads_playlist_id(youtube, channel_id):
+# --- YouTube API Functions (Modified to use passed API key) ---
+def get_channel_uploads_playlist_id(youtube_service_object, channel_id): # Accepts youtube object
     try:
-        request = youtube.channels().list(part="contentDetails", id=channel_id)
+        request = youtube_service_object.channels().list(part="contentDetails", id=channel_id)
         response = request.execute()
         if response.get("items"):
             return response["items"][0]["contentDetails"]["relatedPlaylists"]["uploads"]
     except HttpError as e:
-        print(f"API error getting uploads playlist ID for channel {channel_id}: {e}")
+        print(f"API error getting uploads playlist ID for channel {channel_id}: {e}", file=sys.stderr)
     return None
 
-def fetch_videos_from_playlist(youtube, playlist_id, max_results=25):
+def fetch_videos_from_playlist(youtube_service_object, playlist_id, max_results=25): # Accepts youtube object
     videos = []
     next_page_token = None
     try:
         while True:
-            request = youtube.playlistItems().list(
+            request = youtube_service_object.playlistItems().list(
                 part="snippet",
                 playlistId=playlist_id,
-                maxResults=min(max_results - len(videos), 50), # Fetch up to 50 at a time
+                maxResults=min(max_results - len(videos), 50),
                 pageToken=next_page_token
             )
             response = request.execute()
@@ -177,31 +163,64 @@ def fetch_videos_from_playlist(youtube, playlist_id, max_results=25):
                 video_id = snippet.get("resourceId", {}).get("videoId")
                 title = snippet.get("title")
                 description = snippet.get("description")
-                if video_id and title: # Ensure essential info is present
+                if video_id and title:
                     videos.append({
                         "video_id": video_id,
                         "title": title,
                         "description": description,
-                        "url": f"https://www.youtube.com/watch?v={video_id}" # Corrected URL
+                        "url": f"https://www.youtube.com/watch?v={video_id}" # Standard URL
                     })
                 if len(videos) >= max_results: break
             next_page_token = response.get("nextPageToken")
             if not next_page_token or len(videos) >= max_results: break
-        print(f"Fetched {len(videos)} video snippets from channel's uploads playlist.")
+        print(f"Fetched {len(videos)} video snippets from channel's uploads playlist.", file=sys.stderr)
     except HttpError as e:
-        print(f"API error fetching videos from playlist {playlist_id}: {e}")
+        print(f"API error fetching videos from playlist {playlist_id}: {e}", file=sys.stderr)
     return videos
 
-def fetch_youtube_video_details_and_comments_api(video_url, api_key):
+def fetch_youtube_video_details_and_comments_api(video_url, youtube_api_key_to_use, comments_to_fetch_count_str="100"):
     video_details = {'title': None, 'description': None, 'comments_data': []}
     video_id = extract_video_id(video_url)
     if not video_id: return video_details
 
-    if not api_key:
-        print("Warning: YouTube API Key not set. Cannot fetch video details or comments.")
+    if not youtube_api_key_to_use:
+        print("Warning: YouTube API Key not set. Cannot fetch video details or comments.", file=sys.stderr)
         return video_details
+
+    max_comments_to_fetch = 0
+    if comments_to_fetch_count_str.lower() == 'all':
+        max_comments_to_fetch = float('inf') # Effectively all, YouTube API limits will apply per page
+    else:
+        try:
+            max_comments_to_fetch = int(comments_to_fetch_count_str)
+            if max_comments_to_fetch < 0: max_comments_to_fetch = 0 # No negative fetching
+        except ValueError:
+            print(f"Warning: Invalid comment count '{comments_to_fetch_count_str}'. Defaulting to 0 comments.", file=sys.stderr)
+            max_comments_to_fetch = 0 # Default to 0 if invalid
+
+    if max_comments_to_fetch == 0: # If explicitly 0, don't fetch comments
+        print(f"Comment fetching is set to 0 for video ID: {video_id}", file=sys.stderr)
+        # Still try to get video title and description
+        try:
+            youtube = build('youtube', 'v3', developerKey=youtube_api_key_to_use)
+            video_request = youtube.videos().list(part="snippet", id=video_id)
+            video_response = video_request.execute()
+            if video_response.get("items"):
+                snippet = video_response["items"][0]["snippet"]
+                video_details['title'] = snippet.get("title", "No title (API)")
+                video_details['description'] = snippet.get("description", "No description (API)")
+            else:
+                print(f"Could not fetch video details (API) for ID: {video_id}", file=sys.stderr)
+        except HttpError as e:
+            error_content = e.content.decode('utf-8', 'ignore') if e.content else "No error content"
+            print(f"YouTube API HTTP error (details only) {e.resp.status if e.resp else 'N/A'}: {error_content}", file=sys.stderr)
+        except Exception as e:
+            print(f"Error during YouTube API video detail operations: {e}", file=sys.stderr)
+        return video_details
+
+
     try:
-        youtube = build('youtube', 'v3', developerKey=api_key)
+        youtube = build('youtube', 'v3', developerKey=youtube_api_key_to_use)
         video_request = youtube.videos().list(part="snippet", id=video_id)
         video_response = video_request.execute()
         if video_response.get("items"):
@@ -209,95 +228,104 @@ def fetch_youtube_video_details_and_comments_api(video_url, api_key):
             video_details['title'] = snippet.get("title", "No title (API)")
             video_details['description'] = snippet.get("description", "No description (API)")
         else:
-            print(f"Could not fetch video details (API) for ID: {video_id}")
+            print(f"Could not fetch video details (API) for ID: {video_id}", file=sys.stderr)
 
-        next_page_token = None
-        while True: # Limiting comment fetch for now to avoid excessive API calls during testing
-            comment_request = youtube.commentThreads().list(
-                part='snippet,replies', videoId=video_id, maxResults=100, # Max 100 per page
-                pageToken=next_page_token, textFormat='plainText', order='relevance') # Added order
-            comment_response = comment_request.execute()
-            for item in comment_response.get('items', []):
-                top_comment_snippet = item.get('snippet', {}).get('topLevelComment', {}).get('snippet', {})
-                if top_comment_snippet.get('textDisplay'): # Ensure comment text exists
-                    video_details['comments_data'].append({
-                        'author': top_comment_snippet.get('authorDisplayName', 'Unknown Author'),
-                        'comment_text': top_comment_snippet.get('textDisplay')
-                    })
-                if item.get('replies'):
-                    for reply in item['replies']['comments']:
-                        reply_snippet = reply.get('snippet', {})
-                        if reply_snippet.get('textDisplay'): # Ensure reply text exists
-                            video_details['comments_data'].append({
-                                'author': f"    (Reply to {top_comment_snippet.get('authorDisplayName', 'Original Author')}) {reply_snippet.get('authorDisplayName', 'Unknown Author')}",
-                                'comment_text': reply_snippet.get('textDisplay')
-                            })
-            next_page_token = comment_response.get('nextPageToken')
-            # Removed break for single page to fetch more comments if available
-            if not next_page_token or len(video_details['comments_data']) >= 200: # Cap at 200 comments for now
-                 break
-        if video_details['comments_data']:
-            print(f"Extracted {len(video_details['comments_data'])} comments (API).")
-        else:
-            print(f"No comments found or extracted for video ID: {video_id}")
+        if max_comments_to_fetch > 0: # Only proceed if we need to fetch comments
+            next_page_token = None
+            comments_fetched_count = 0
+            while True:
+                # Determine maxResults for this page
+                remaining_to_fetch = max_comments_to_fetch - comments_fetched_count
+                results_this_page = min(100, remaining_to_fetch if max_comments_to_fetch != float('inf') else 100)
+                if results_this_page <= 0 and max_comments_to_fetch != float('inf'): break
+
+
+                comment_request = youtube.commentThreads().list(
+                    part='snippet,replies', videoId=video_id, maxResults=results_this_page,
+                    pageToken=next_page_token, textFormat='plainText', order='relevance')
+                comment_response = comment_request.execute()
+
+                for item in comment_response.get('items', []):
+                    if comments_fetched_count >= max_comments_to_fetch: break
+                    top_comment_snippet = item.get('snippet', {}).get('topLevelComment', {}).get('snippet', {})
+                    if top_comment_snippet.get('textDisplay'):
+                        video_details['comments_data'].append({
+                            'author': top_comment_snippet.get('authorDisplayName', 'Unknown Author'),
+                            'comment_text': top_comment_snippet.get('textDisplay')
+                        })
+                        comments_fetched_count += 1
+                    
+                    if comments_fetched_count >= max_comments_to_fetch: break
+
+                    if item.get('replies'):
+                        for reply in item['replies']['comments']:
+                            if comments_fetched_count >= max_comments_to_fetch: break
+                            reply_snippet = reply.get('snippet', {})
+                            if reply_snippet.get('textDisplay'):
+                                video_details['comments_data'].append({
+                                    'author': f"    (Reply to {top_comment_snippet.get('authorDisplayName', 'Original Author')}) {reply_snippet.get('authorDisplayName', 'Unknown Author')}",
+                                    'comment_text': reply_snippet.get('textDisplay')
+                                })
+                                comments_fetched_count += 1
+                
+                next_page_token = comment_response.get('nextPageToken')
+                if not next_page_token or comments_fetched_count >= max_comments_to_fetch:
+                    break
+            
+            if video_details['comments_data']:
+                print(f"Extracted {len(video_details['comments_data'])} comments (API) for {video_id}.", file=sys.stderr)
+            else:
+                print(f"No comments found or extracted for video ID: {video_id}", file=sys.stderr)
     except HttpError as e:
         error_content = e.content.decode('utf-8', 'ignore') if e.content else "No error content"
-        print(f"YouTube API HTTP error {e.resp.status if e.resp else 'N/A'}: {error_content}")
+        print(f"YouTube API HTTP error {e.resp.status if e.resp else 'N/A'}: {error_content}", file=sys.stderr)
     except Exception as e:
-        print(f"Error during YouTube API operations: {e}")
+        print(f"Error during YouTube API operations: {e}", file=sys.stderr)
     return video_details
 
 
-# --- yt-dlp Audio Download ---
+# --- yt-dlp Audio Download (largely unchanged, ensure FFMPEG_LOCATION if needed) ---
 def download_audio_mp3_yt_dlp(video_url, output_path='.', filename_template='audio.%(ext)s'):
-    # Ensure the base filename is 'audio' so we can predict 'audio.mp3'
     base_filename = os.path.splitext(filename_template)[0]
     actual_filename_mp3 = os.path.join(output_path, f"{base_filename}.mp3")
 
     ydl_opts = {
         'format': 'bestaudio/best',
         'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}],
-        'outtmpl': os.path.join(output_path, base_filename), # yt-dlp adds .mp3
-        'quiet': False, 'noplaylist': True, 'nocheckcertificate': True,
-        'ignoreerrors': True, # Continue on download errors for individual videos if in a playlist context (though noplaylist is True)
+        'outtmpl': os.path.join(output_path, base_filename),
+        'quiet': True, 'noplaylist': True, 'nocheckcertificate': True, # quiet True
+        'ignoreerrors': True,
     }
     if FFMPEG_LOCATION: ydl_opts['ffmpeg_location'] = FFMPEG_LOCATION
 
     try:
-        print(f"\nDownloading audio for: {video_url} to {os.path.abspath(output_path)}")
+        print(f"\nDownloading audio for: {video_url} to {os.path.abspath(output_path)}", file=sys.stderr)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([video_url])
-
         if os.path.exists(actual_filename_mp3):
-            print(f"Audio downloaded and converted to MP3: {actual_filename_mp3}")
+            print(f"Audio downloaded and converted to MP3: {actual_filename_mp3}", file=sys.stderr)
             return actual_filename_mp3
         else:
-            # Fallback: Check if any .mp3 file was created in the directory if the exact name isn't found
-            # This can happen if the title had special characters that yt-dlp sanitized differently.
-            # However, with 'outtmpl' set to a fixed name like 'audio', this should be less of an issue.
+            # Fallback for sanitized names (less likely with fixed outtmpl base)
             found_mp3s = [f for f in os.listdir(output_path) if f.lower().endswith(".mp3") and f.lower().startswith(base_filename.lower())]
             if found_mp3s:
                 found_path = os.path.join(output_path, found_mp3s[0])
-                # Optionally rename to the expected actual_filename_mp3
-                # os.rename(found_path, actual_filename_mp3)
-                print(f"Audio downloaded. Found MP3 (possibly sanitized name): {found_path}")
-                return found_path # or actual_filename_mp3 if renamed
-            print(f"Error: MP3 file not found at {actual_filename_mp3} or matching pattern in {output_path}.")
+                print(f"Audio downloaded. Found MP3 (possibly sanitized name): {found_path}", file=sys.stderr)
+                return found_path
+            print(f"Error: MP3 file not found at {actual_filename_mp3} or matching pattern in {output_path}.", file=sys.stderr)
             return None
     except Exception as e:
-        print(f"Error during audio download for {video_url}: {e}")
+        print(f"Error during audio download for {video_url}: {e}", file=sys.stderr)
     return None
 
-# --- AI Agents (Langchain & Fireworks AI) ---
-# --- Leniency Calculation Functions ---
+# --- AI Agents (Modified to accept fireworks_api_key) ---
 def calculate_targeted_sentiment_summary(analyses_list, title="Targeted Sentiment Summary"):
-    """
-    Calculates and prints targeted sentiment distribution from a list of analyses.
-    Each item in analyses_list is expected to conform to TargetedCommentSentiment model.
-    """
+    # (Function content largely unchanged, but ensure it prints to stderr or returns data for main to handle)
+    # For simplicity, this function will continue to print to stderr for its verbose output.
+    # The JSON data it returns will be used for file saving by the caller.
     if not analyses_list:
-        print(f"\n--- {title} ---")
-        print("No targeted sentiment analyses provided to summarize.")
+        print(f"\n--- {title} ---", file=sys.stderr)
+        print("No targeted sentiment analyses provided to summarize.", file=sys.stderr)
         return {
             "by_entity": {entity: {"positive": 0, "negative": 0, "neutral": 0, "sarcastic_count": 0,
                                    "sum_sentiment_score": 0.0, "valid_score_count": 0,
@@ -305,7 +333,7 @@ def calculate_targeted_sentiment_summary(analyses_list, title="Targeted Sentimen
                           for entity in TARGETABLE_MALAYSIAN_POLITICAL_ENTITIES},
             "overall_stats": {
                 "total_analyzed_items": 0,
-                "valid_analyses": 0, # Analyses that are dicts
+                "valid_analyses": 0, 
                 "total_sarcastic_comments_overall": 0,
             }
         }
@@ -315,11 +343,10 @@ def calculate_targeted_sentiment_summary(analyses_list, title="Targeted Sentimen
             "positive": 0, "negative": 0, "neutral": 0,
             "sarcastic_count": 0,
             "sum_sentiment_score": 0.0, "valid_score_count": 0,
-            "comment_count": 0, # Total comments primarily targeting this entity
+            "comment_count": 0, 
             "average_sentiment_score": 0.0
         } for entity in TARGETABLE_MALAYSIAN_POLITICAL_ENTITIES
     }
-
     overall_stats = {
         "total_analyzed_items": 0,
         "valid_analyses": 0,
@@ -329,7 +356,7 @@ def calculate_targeted_sentiment_summary(analyses_list, title="Targeted Sentimen
     for analysis in analyses_list:
         overall_stats["total_analyzed_items"] += 1
         if not isinstance(analysis, dict):
-            print(f"Skipping invalid analysis item (not a dict): {analysis}")
+            print(f"Skipping invalid analysis item (not a dict): {analysis}", file=sys.stderr)
             continue
 
         overall_stats["valid_analyses"] += 1
@@ -338,12 +365,11 @@ def calculate_targeted_sentiment_summary(analyses_list, title="Targeted Sentimen
         score = analysis.get('sentiment_score')
         is_sarcastic = analysis.get('is_sarcastic', False)
 
-        # Validate and normalize target_entity
         if target_entity not in TARGETABLE_MALAYSIAN_POLITICAL_ENTITIES:
-            original_target = target_entity # Store for logging
-            target_entity = "General Comment/No Specific Listed Entity" # Default to general
+            original_target = target_entity 
+            target_entity = "General Comment/No Specific Listed Entity" 
             print(f"Warning: Unrecognized 'primary_target_entity' ('{original_target}') found. "
-                  f"Classifying under '{target_entity}'. Comment: '{analysis.get('comment_text', 'N/A')[:50]}...'")
+                  f"Classifying under '{target_entity}'. Comment: '{analysis.get('comment_text', 'N/A')[:50]}...'", file=sys.stderr)
         
         entity_data = sentiment_by_entity[target_entity]
         entity_data["comment_count"] += 1
@@ -352,8 +378,8 @@ def calculate_targeted_sentiment_summary(analyses_list, title="Targeted Sentimen
             entity_data[sentiment] += 1
         else:
             print(f"Warning: Unknown 'sentiment_expressed' ('{sentiment}') for target '{target_entity}'. "
-                  f"Defaulting to neutral. Comment: '{analysis.get('comment_text', 'N/A')[:50]}...'")
-            entity_data["neutral"] += 1 # Default to neutral
+                  f"Defaulting to neutral. Comment: '{analysis.get('comment_text', 'N/A')[:50]}...'", file=sys.stderr)
+            entity_data["neutral"] += 1
 
         if isinstance(score, (float, int)):
             entity_data["sum_sentiment_score"] += float(score)
@@ -363,52 +389,49 @@ def calculate_targeted_sentiment_summary(analyses_list, title="Targeted Sentimen
             entity_data["sarcastic_count"] += 1
             overall_stats["total_sarcastic_comments_overall"] += 1
 
-    # Calculate averages for each entity
     for entity, data in sentiment_by_entity.items():
         if data["valid_score_count"] > 0:
             data["average_sentiment_score"] = data["sum_sentiment_score"] / data["valid_score_count"]
         else:
-            data["average_sentiment_score"] = 0.0 # Or None, or handle in printing
+            data["average_sentiment_score"] = 0.0
 
-    summary_output = {
+    summary_output_dict = { # This dictionary will be returned
         "by_entity": sentiment_by_entity,
         "overall_stats": overall_stats
     }
 
-    # Print textual summary
-    print(f"\n--- {title} ---")
-    print(f"Overall Items Processed: {overall_stats['total_analyzed_items']}")
-    print(f"Overall Valid Analyses: {overall_stats['valid_analyses']}")
-    print(f"Overall Sarcastic Comments: {overall_stats['total_sarcastic_comments_overall']}")
-    print("\nSentiment Breakdown by Primary Target Entity:")
+    # Print textual summary to stderr
+    print(f"\n--- {title} (Printed to Stderr) ---", file=sys.stderr)
+    print(f"Overall Items Processed: {overall_stats['total_analyzed_items']}", file=sys.stderr)
+    print(f"Overall Valid Analyses: {overall_stats['valid_analyses']}", file=sys.stderr)
+    print(f"Overall Sarcastic Comments: {overall_stats['total_sarcastic_comments_overall']}", file=sys.stderr)
+    print("\nSentiment Breakdown by Primary Target Entity:", file=sys.stderr)
 
-    for entity_name, data in summary_output["by_entity"].items():
-        if data["comment_count"] > 0: # Only print entities that had associated comments
-            print(f"\n  Entity: {entity_name} ({data['comment_count']} comment(s) primarily targeted)")
-            print(f"    Sentiments: Positive: {data['positive']}, Negative: {data['negative']}, Neutral: {data['neutral']}")
-            print(f"    Sarcastic comments for this entity: {data['sarcastic_count']}")
+    for entity_name, data in summary_output_dict["by_entity"].items():
+        if data["comment_count"] > 0:
+            print(f"\n  Entity: {entity_name} ({data['comment_count']} comment(s) primarily targeted)", file=sys.stderr)
+            print(f"    Sentiments: Positive: {data['positive']}, Negative: {data['negative']}, Neutral: {data['neutral']}", file=sys.stderr)
+            print(f"    Sarcastic comments for this entity: {data['sarcastic_count']}", file=sys.stderr)
             avg_score_display = f"{data['average_sentiment_score']:.2f}" if data['valid_score_count'] > 0 else "N/A"
-            print(f"    Average Sentiment Score: {avg_score_display} (from {data['valid_score_count']} scored comments)")
+            print(f"    Average Sentiment Score: {avg_score_display} (from {data['valid_score_count']} scored comments)", file=sys.stderr)
             
-    return summary_output
+    return summary_output_dict
 
-# Agent 0: Filter Channel Videos for Political Content
-# Agent 0: Filter Channel Videos for Political Content
-def filter_video_for_politics_llm(video_info, fireworks_api_key):
-    if not fireworks_api_key:
-        print("Fireworks API Key missing for LLM filtering.")
-        return None
-    llm = ChatFireworks(model="accounts/fireworks/models/llama4-maverick-instruct-basic", fireworks_api_key=fireworks_api_key, temperature=0.0, max_tokens=300)
 
-    # --- FIX APPLIED HERE for Pydantic V2 ---
-    # Generate the schema dictionary
+def filter_video_for_politics_llm(video_info, fireworks_api_key_to_use): # Param name updated
+    if not fireworks_api_key_to_use:
+        print("Fireworks API Key missing for LLM filtering.", file=sys.stderr)
+        # Return a structure that indicates failure but includes original info
+        return {"is_political": False,
+                "reasoning": "Error: Fireworks API Key missing for filtering.",
+                "video_title": video_info.get("title"),
+                "video_id": video_info.get("video_id")}
+
+    llm = ChatFireworks(model="accounts/fireworks/models/llama4-maverick-instruct-basic", fireworks_api_key=fireworks_api_key_to_use, temperature=0.0, max_tokens=300) # Updated model
     political_video_check_schema_dict = PoliticalVideoCheck.model_json_schema()
-    # Convert the schema dictionary to a JSON string
     political_video_check_schema_str = json.dumps(political_video_check_schema_dict, indent=2)
-    # Escape the curly braces within the schema string
     escaped_political_video_check_schema = political_video_check_schema_str.replace("{", "{{").replace("}", "}}")
-    # --- END FIX ---
-
+    
     system_prompt = (
         "You are an AI assistant acting as a preliminary filter for a **Malaysian political sentiment analysis project.** "
         "Your task is to determine if a YouTube video, based *only* on its title and description, is **PRIMARILY and SUBSTANTIVELY focused on Malaysian politics**, making it a good candidate for subsequent in-depth sentiment analysis of its content and comments."
@@ -429,142 +452,163 @@ def filter_video_for_politics_llm(video_info, fireworks_api_key):
         "\n\n"
         "The language of the title or description may be English or Malay."
         "Your response MUST be a single, valid JSON object, and NOTHING ELSE. Do not add any explanatory text before or after the JSON. "
-        f"The JSON object must strictly adhere to the following Pydantic schema: {escaped_political_video_check_schema}" # Ensure this variable is correctly defined in your scope
+        f"The JSON object must strictly adhere to the following Pydantic schema: {escaped_political_video_check_schema}"
     )
-
     human_prompt = (
         "Video Title: {video_title}\n"
         "Video Description: {video_description}\n\n"
         "Based on the title and description, and the detailed criteria in the system prompt, is this video primarily related to Malaysian politics and suitable for sentiment analysis? "
         "Provide your answer as a JSON object matching the schema. Ensure all fields ('is_political', 'reasoning', 'video_title', 'video_id') are present."
     )
-    
     prompt_template = ChatPromptTemplate.from_messages([("system", system_prompt), ("human", human_prompt)])
-    chain_llm_part = prompt_template | llm | StrOutputParser()
-    json_parser = JsonOutputParser(pydantic_object=PoliticalVideoCheck)
+    # Use JsonOutputParser directly with the chain for Pydantic v2
+    chain_llm_part = prompt_template | llm | JsonOutputParser(pydantic_object=PoliticalVideoCheck)
 
-    raw_llm_output = ""
+    raw_llm_output_for_debug = "" # For debugging if parsing fails
     try:
-        raw_llm_output = chain_llm_part.invoke({
+        # parsed_output is what JsonOutputParser returns
+        parsed_output = chain_llm_part.invoke({
             "video_title": video_info.get("title", ""),
-            "video_description": video_info.get("description", "")[:1000]
+            "video_description": video_info.get("description", "")[:1000] # Limit description length
         })
-        cleaned_output = clean_llm_json_output(raw_llm_output)
-        result = json_parser.parse(cleaned_output)
-        result_dict = result if isinstance(result, dict) else result.dict()
-        result_dict['video_title'] = video_info.get("title")
-        result_dict['video_id'] = video_info.get("video_id")
-        return result_dict
+
+        result_dict = None # Initialize
+
+        if isinstance(parsed_output, dict):
+            result_dict = parsed_output # It's already a dict
+        elif isinstance(parsed_output, PoliticalVideoCheck): # PoliticalVideoCheck is your Pydantic model
+            # It's a Pydantic model instance, convert to dict
+            if hasattr(parsed_output, 'model_dump'): # Pydantic V2
+                result_dict = parsed_output.model_dump()
+            elif hasattr(parsed_output, 'dict'): # Pydantic V1
+                result_dict = parsed_output.dict()
+            else:
+                print(f"Error: Pydantic model {type(parsed_output)} has no model_dump/dict method.", file=sys.stderr)
+                # Fallback: create a dict with error info
+                result_dict = {"is_political": False, "reasoning": "Pydantic model conversion error"}
+        else:
+            print(f"Error: LLM JsonOutputParser returned unexpected type: {type(parsed_output)}", file=sys.stderr)
+            result_dict = {"is_political": False, "reasoning": f"LLM output parsing error, unexpected type: {type(parsed_output)}"}
+
+        # Ensure the final dictionary has the required structure, including defaults if parsing failed partially
+        final_result = {
+            "is_political": result_dict.get('is_political', False),
+            "reasoning": result_dict.get('reasoning', "Reasoning missing or error during parsing."),
+            "video_title": video_info.get("title"), # Ensure these are always present
+            "video_id": video_info.get("video_id")
+        }
+        return final_result
+
     except Exception as e:
-        print(f"LLM filtering error for video '{video_info.get('title')}'. \nError: {e}")
-        print(f"Raw LLM output that caused parsing error:\n---\n{raw_llm_output}\n---")
+        # This block catches other errors during the invoke() or if the above logic fails unexpectedly
+        str_parser_for_debug = StrOutputParser()
+        try:
+            # Attempt to get raw output for debugging if the chain invocation itself failed earlier
+            raw_llm_output_for_debug = (prompt_template | llm | str_parser_for_debug).invoke({
+                "video_title": video_info.get("title", ""),
+                "video_description": video_info.get("description", "")[:1000]
+            })
+        except Exception as dbg_e: # Catch errors during this debug attempt
+            raw_llm_output_for_debug = f"Could not retrieve raw LLM output for debugging. Debug error: {dbg_e}"
+
+        print(f"LLM filtering error for video '{video_info.get('title')}'. \nOriginal Error: {e}", file=sys.stderr)
+        print(f"Raw LLM output (if retrievable) that might have caused error:\n---\n{raw_llm_output_for_debug}\n---", file=sys.stderr)
+        # Return the standard error structure
         return {"is_political": False,
-                "reasoning": f"Error in LLM analysis: {e}. Raw output: {raw_llm_output[:200]}...",
+                "reasoning": f"Error in LLM analysis: {e}. Raw output sample: {raw_llm_output_for_debug[:200]}...",
                 "video_title": video_info.get("title"),
                 "video_id": video_info.get("video_id")}
 
 
-
-def agent0_fetch_and_filter_videos(channel_id, youtube_api_key, fireworks_api_key, max_videos_to_scan=25):
-    print("\n--- Agent 0: Fetching and Filtering Channel Videos ---")
-    if not youtube_api_key:
-        print("YouTube API Key missing. Cannot fetch channel videos.")
+def agent0_fetch_and_filter_videos(channel_id, youtube_api_key_to_use, fireworks_api_key_to_use, max_videos_to_scan=25):
+    print("\n--- Agent 0: Fetching and Filtering Channel Videos ---", file=sys.stderr)
+    if not youtube_api_key_to_use:
+        print("YouTube API Key missing. Cannot fetch channel videos.", file=sys.stderr)
         return []
-    if not fireworks_api_key:
-        print("Fireworks API Key missing. Cannot filter videos using LLM.")
-        # Optionally, one could return all videos if LLM filtering is not possible,
-        # but for this script's purpose, filtering is key.
-        return []
+    # Fireworks API key check is handled by filter_video_for_politics_llm
 
-    youtube = build('youtube', 'v3', developerKey=youtube_api_key)
-    uploads_playlist_id = get_channel_uploads_playlist_id(youtube, channel_id)
+    youtube_service = build('youtube', 'v3', developerKey=youtube_api_key_to_use)
+    uploads_playlist_id = get_channel_uploads_playlist_id(youtube_service, channel_id)
     if not uploads_playlist_id:
-        print(f"Could not find uploads playlist for channel ID: {channel_id}")
+        print(f"Could not find uploads playlist for channel ID: {channel_id}", file=sys.stderr)
         return []
 
-    print(f"Fetching latest up to {max_videos_to_scan} videos from channel {channel_id} (Playlist: {uploads_playlist_id})...")
-    channel_videos = fetch_videos_from_playlist(youtube, uploads_playlist_id, max_results=max_videos_to_scan)
+    print(f"Fetching latest up to {max_videos_to_scan} videos from channel {channel_id} (Playlist: {uploads_playlist_id})...", file=sys.stderr)
+    channel_videos = fetch_videos_from_playlist(youtube_service, uploads_playlist_id, max_results=max_videos_to_scan)
 
     political_videos = []
     if not channel_videos:
-        print("No videos found in the channel's uploads playlist or error fetching.")
+        print("No videos found in the channel's uploads playlist or error fetching.", file=sys.stderr)
         return []
 
-    print(f"\nFiltering {len(channel_videos)} videos for political content using LLM...")
+    print(f"\nFiltering {len(channel_videos)} videos for political content using LLM...", file=sys.stderr)
     for i, video_info in enumerate(channel_videos):
-        print(f"  Filtering video {i+1}/{len(channel_videos)}: {video_info.get('title', 'N/A')[:70]}...")
-        # Add a small delay to avoid hitting rate limits if any are very strict
-        # time.sleep(0.5) # Increased delay slightly
-        filter_result = filter_video_for_politics_llm(video_info, fireworks_api_key)
+        print(f"  Filtering video {i+1}/{len(channel_videos)}: {video_info.get('title', 'N/A')[:70]}...", file=sys.stderr)
+        # Pass the fireworks_api_key_to_use to the filtering function
+        filter_result = filter_video_for_politics_llm(video_info, fireworks_api_key_to_use)
 
         if filter_result and isinstance(filter_result, dict) and filter_result.get('is_political'):
             political_videos.append({
-                "title": filter_result.get('video_title'),
-                "video_id": filter_result.get('video_id'),
-                "url": f"https://www.youtube.com/watch?v={filter_result.get('video_id')}", # Use standard URL
-                "reasoning_for_political": filter_result.get('reasoning')
+                "title": filter_result.get('video_title'), # Already set by filter_video_for_politics_llm
+                "video_id": filter_result.get('video_id'), # Already set
+                "url": f"https://www.youtube.com/watch?v={filter_result.get('video_id')}",
+                "reasoning_for_political": filter_result.get('reasoning'),
+                "description": video_info.get("description", "") # Keep original description if needed later
             })
         elif filter_result and isinstance(filter_result, dict):
-            print(f"    Video '{filter_result.get('video_title')}' not primarily political. Reason: {filter_result.get('reasoning')}")
+            print(f"    Video '{filter_result.get('video_title')}' not primarily political. Reason: {filter_result.get('reasoning')}", file=sys.stderr)
         else:
-            print(f"    Could not determine political nature for video '{video_info.get('title', 'N/A')}'.")
-        time.sleep(1) # Rate limiting for LLM calls
+            print(f"    Could not determine political nature for video '{video_info.get('title', 'N/A')}'.", file=sys.stderr)
+        time.sleep(1) # Rate limiting for LLM calls (per video)
 
-    print(f"\nAgent 0 found {len(political_videos)} politics-related videos out of {len(channel_videos)} scanned.")
+    print(f"\nAgent 0 found {len(political_videos)} politics-related videos out of {len(channel_videos)} scanned.", file=sys.stderr)
     return political_videos
 
-# Agent 1: Transcription
-def transcribe_audio_fireworks(mp3_file_path, api_key):
-    if not api_key:
-        print("Fireworks API Key missing for transcription.")
+
+def transcribe_audio_fireworks(mp3_file_path, fireworks_api_key_to_use): # Param updated
+    if not fireworks_api_key_to_use:
+        print("Fireworks API Key missing for transcription.", file=sys.stderr)
         return None
     if not os.path.exists(mp3_file_path):
-        print(f"MP3 file not found for transcription: {mp3_file_path}")
+        print(f"MP3 file not found for transcription: {mp3_file_path}", file=sys.stderr)
         return None
 
-    print(f"Starting transcription for: {mp3_file_path} (Fireworks Whisper)...")
-    # Ensure you have the `openai` package installed and configured for Fireworks
-    client = openai.OpenAI(api_key=api_key, base_url="https://api.fireworks.ai/inference/v1")
+    print(f"Starting transcription for: {mp3_file_path} (Fireworks Whisper)...", file=sys.stderr)
+    client = openai.OpenAI(api_key=fireworks_api_key_to_use, base_url="https://api.fireworks.ai/inference/v1")
     try:
         with open(mp3_file_path, "rb") as audio_file:
-            # Using whisper-large-v3 as it's generally more accurate
-            # The model name might be just "whisper-large-v3" or "accounts/fireworks/models/whisper-large-v3"
-            # Check Fireworks documentation for the exact model identifier.
+            # Model updated based on Fireworks common model naming
             transcript_response = client.audio.transcriptions.create(
-                model="whisper-v3", # Using a more specific model name
+                model="whisper-v3", # More specific model name
                 file=audio_file,
-                response_format="text" # Requesting plain text output
+                response_format="text"
             )
-        # The response for "text" format is directly the string
         transcribed_text = transcript_response if isinstance(transcript_response, str) else str(transcript_response)
-
-        print("Transcription successful.")
+        print("Transcription successful.", file=sys.stderr)
         return transcribed_text.strip()
     except Exception as e:
-        print(f"Fireworks Whisper transcription error: {e}")
-        # Attempt to get more details from the error if it's an APIError
+        print(f"Fireworks Whisper transcription error: {e}", file=sys.stderr)
         if hasattr(e, 'response') and e.response is not None:
             try:
                 error_details = e.response.json()
-                print(f"API Error Details: {error_details}")
+                print(f"API Error Details: {error_details}", file=sys.stderr)
             except json.JSONDecodeError:
-                print(f"API Error Content (not JSON): {e.response.text}")
+                print(f"API Error Content (not JSON): {e.response.text}", file=sys.stderr)
         elif hasattr(e, 'message'):
-             print(f"Error Message: {e.message}")
+             print(f"Error Message: {e.message}", file=sys.stderr)
     return None
 
-# Agent 2: Contextual Summary
-def generate_contextual_summary_langchain(transcribed_text, video_title, video_description, api_key):
-    if not api_key:
-        print("Fireworks API Key missing for summary generation.")
+
+def generate_contextual_summary_langchain(transcribed_text, video_title, video_description, fireworks_api_key_to_use): # Param updated
+    if not fireworks_api_key_to_use:
+        print("Fireworks API Key missing for summary generation.", file=sys.stderr)
         return None
     if not transcribed_text or transcribed_text.strip() == "":
-        print("Transcription text is empty or missing. Cannot generate summary.")
+        print("Transcription text is empty or missing. Cannot generate summary.", file=sys.stderr)
         return "Contextual summary could not be generated due to missing transcription."
 
-    print("Generating contextual summary (Langchain + Fireworks AI)...")
-    # Consider models fine-tuned for summarization or instruct models
-    llm = ChatFireworks(model="accounts/fireworks/models/llama4-maverick-instruct-basic", fireworks_api_key=api_key, max_tokens=1024, temperature=0.3)
+    print("Generating contextual summary (Langchain + Fireworks AI)...", file=sys.stderr)
+    llm = ChatFireworks(model="accounts/fireworks/models/llama4-maverick-instruct-basic", fireworks_api_key=fireworks_api_key_to_use, max_tokens=1024, temperature=0.3) # Updated model
     prompt_template = ChatPromptTemplate.from_messages([
         ("system", (
             "You are an AI assistant tasked with creating a concise contextual summary of a YouTube video. "
@@ -585,23 +629,19 @@ def generate_contextual_summary_langchain(transcribed_text, video_title, video_d
     try:
         summary = chain.invoke({
             "video_title": video_title or "N/A",
-            "video_description": (video_description or "N/A")[:1500], # Limit description length
+            "video_description": (video_description or "N/A")[:1500],
             "transcribed_text": transcribed_text
         })
-        print("Contextual summary generated.")
+        print("Contextual summary generated.", file=sys.stderr)
         return summary.strip()
     except Exception as e:
-        print(f"Summary generation error: {e}")
+        print(f"Summary generation error: {e}", file=sys.stderr)
     return None
 
-# Agent 3: Political Leniency & Sarcasm Analysis
-# TODO: Consider renaming this function later to reflect its new purpose (sentiment analysis).
-# Its name is now misleading as it performs sentiment analysis.
-def analyze_comment_sentiment_analysis_langchain(comment, contextual_summary, video_title, video_description, api_key):
-    # This function now performs TARGETED SENTIMENT ANALYSIS.
-    if not api_key:
-        print("Fireworks API Key missing for targeted comment sentiment analysis.")
-        return { # Return a structure matching TargetedCommentSentiment
+def analyze_comment_sentiment_analysis_langchain(comment, contextual_summary, video_title, video_description, fireworks_api_key_to_use): # Param updated
+    if not fireworks_api_key_to_use:
+        print("Fireworks API Key missing for targeted comment sentiment analysis.", file=sys.stderr)
+        return {
             "comment_text": comment.get('comment_text', "Error: API key missing"),
             "is_sarcastic": False, "sarcasm_reasoning": "N/A",
             "primary_target_entity": "General Comment/No Specific Listed Entity",
@@ -610,9 +650,7 @@ def analyze_comment_sentiment_analysis_langchain(comment, contextual_summary, vi
             "overall_reasoning": "Error: Fireworks API Key missing."
         }
 
-    llm = ChatFireworks(model="accounts/fireworks/models/llama4-maverick-instruct-basic", fireworks_api_key=api_key, temperature=0.1, max_tokens=8124) # Increased max_tokens slightly for more complex output
-
-    # Generate the schema dictionary for TargetedCommentSentiment
+    llm = ChatFireworks(model="accounts/fireworks/models/llama4-maverick-instruct-basic", fireworks_api_key=fireworks_api_key_to_use, temperature=0.1, max_tokens=1024) # Updated model, max_tokens adjusted
     targeted_sentiment_schema_dict = TargetedCommentSentiment.model_json_schema()
     targeted_sentiment_schema_str = json.dumps(targeted_sentiment_schema_dict, indent=2)
     escaped_targeted_sentiment_schema = targeted_sentiment_schema_str.replace("{", "{{").replace("}", "}}")
@@ -634,7 +672,6 @@ def analyze_comment_sentiment_analysis_langchain(comment, contextual_summary, vi
         "Your response MUST be a single, valid JSON object, and NOTHING ELSE. Do not add any explanatory text before or after the JSON. "
         f"The JSON object must strictly adhere to this Pydantic schema: {escaped_targeted_sentiment_schema}"
     )
-
     human_prompt = (
         "Video Title: {video_title}\n"
         "Video Description: {video_description}\n"
@@ -643,14 +680,11 @@ def analyze_comment_sentiment_analysis_langchain(comment, contextual_summary, vi
         "YouTube Comment:\n\"\"\"\n{comment_text}\n\"\"\"\n\n"
         "Targeted Sentiment Analysis (JSON Object):"
     )
-
     prompt_template = ChatPromptTemplate.from_messages([("system", system_prompt), ("human", human_prompt)])
-    chain_llm_part = prompt_template | llm | StrOutputParser()
-    json_parser = JsonOutputParser(pydantic_object=TargetedCommentSentiment) # Use the NEW Pydantic model
+    chain_llm_part = prompt_template | llm | JsonOutputParser(pydantic_object=TargetedCommentSentiment)
 
-    comment_text_to_analyze = comment.get('comment_text', "")
-    raw_llm_output = ""
-
+    comment_text_to_analyze = comment.get('comment_text', "") # Ensure this is defined
+    # Define default_error_output specific to this function's Pydantic model
     default_error_output = {
         "comment_text": comment_text_to_analyze, "is_sarcastic": False, "sarcasm_reasoning": "N/A - Analysis error",
         "primary_target_entity": "General Comment/No Specific Listed Entity",
@@ -658,480 +692,331 @@ def analyze_comment_sentiment_analysis_langchain(comment, contextual_summary, vi
         "sentiment_expressed": "neutral", "sentiment_score": 0.0,
         "overall_reasoning": "Could not perform targeted sentiment analysis due to an error."
     }
-
-    if not comment_text_to_analyze.strip():
+    if not comment_text_to_analyze.strip(): # Handle empty comments earlier
         empty_comment_output = default_error_output.copy()
-        empty_comment_output["comment_text"] = ""
+        empty_comment_output["comment_text"] = "" # Override if it was None
         empty_comment_output["sarcasm_reasoning"] = "N/A - Comment was empty."
         empty_comment_output["entity_identification_reasoning"] = "Comment was empty."
         empty_comment_output["overall_reasoning"] = "Comment was empty or whitespace only."
         return empty_comment_output
 
+    raw_llm_output_for_debug = ""
     try:
-        raw_llm_output = chain_llm_part.invoke({
+        parsed_output = chain_llm_part.invoke({
             "video_title": video_title or "N/A",
             "video_description": (video_description or "N/A")[:1000],
             "contextual_summary": contextual_summary or "N/A",
             "comment_text": comment_text_to_analyze
         })
-        cleaned_output = clean_llm_json_output(raw_llm_output)
-        result = json_parser.parse(cleaned_output)
-        result_dict = result if isinstance(result, dict) else result.dict()
+
+        result_dict = None # Initialize
+
+        if isinstance(parsed_output, dict):
+            result_dict = parsed_output # It's already a dict
+        elif isinstance(parsed_output, TargetedCommentSentiment): # Your Pydantic model
+            if hasattr(parsed_output, 'model_dump'): # Pydantic V2
+                result_dict = parsed_output.model_dump()
+            elif hasattr(parsed_output, 'dict'): # Pydantic V1
+                result_dict = parsed_output.dict()
+            else:
+                print(f"Error: Pydantic model {type(parsed_output)} has no model_dump/dict method.", file=sys.stderr)
+                result_dict = default_error_output.copy()
+                result_dict["overall_reasoning"] = "Pydantic model conversion error"
+        else:
+            print(f"Error: LLM JsonOutputParser returned unexpected type: {type(parsed_output)}", file=sys.stderr)
+            result_dict = default_error_output.copy()
+            result_dict["overall_reasoning"] = f"LLM output parsing error, unexpected type: {type(parsed_output)}"
+        
+        # Ensure the original comment_text is in the final dict
         result_dict['comment_text'] = comment_text_to_analyze
         return result_dict
+
     except Exception as e:
-        print(f"Targeted sentiment analysis error for comment '{comment_text_to_analyze[:50]}...'. \nError: {e}")
-        print(f"Raw LLM output that caused parsing error:\n---\n{raw_llm_output}\n---")
-        error_output = default_error_output.copy()
-        error_output["sarcasm_reasoning"] = f"LLM Analysis Error. Raw: {raw_llm_output[:100]}"
-        error_output["overall_reasoning"] = f"LLM error during targeted sentiment analysis: {str(e)[:100]}"
-        return error_output
+        str_parser_for_debug = StrOutputParser()
+        try:
+            raw_llm_output_for_debug = (prompt_template | llm | str_parser_for_debug).invoke({
+                "video_title": video_title or "N/A",
+                "video_description": (video_description or "N/A")[:1000],
+                "contextual_summary": contextual_summary or "N/A",
+                "comment_text": comment_text_to_analyze
+            })
+        except Exception as dbg_e:
+            raw_llm_output_for_debug = f"Could not retrieve raw LLM output for debugging. Debug error: {dbg_e}"
 
+        print(f"Targeted sentiment analysis error for comment '{comment_text_to_analyze[:50]}...'. \nOriginal Error: {e}", file=sys.stderr)
+        print(f"Raw LLM output (if retrievable) that might have caused error:\n---\n{raw_llm_output_for_debug}\n---", file=sys.stderr)
+        
+        error_output_on_exception = default_error_output.copy()
+        error_output_on_exception["sarcasm_reasoning"] = f"LLM Analysis Exception. Raw: {raw_llm_output_for_debug[:100]}"
+        error_output_on_exception["overall_reasoning"] = f"LLM exception during targeted sentiment analysis: {str(e)[:100]}"
+        return error_output_on_exception
 
-
-# --- New Function for ASCII Leniency Summary ---
-def generate_and_display_targeted_sentiment_visual(summary_data, max_bar_width=30):
-    """
-    Generates and displays ASCII bar charts for targeted sentiment distribution per entity.
-    Takes summary_data from calculate_targeted_sentiment_summary.
-    """
-    print("\n--- Targeted Sentiment Distribution Visual ---")
+# --- Modified Function for ASCII Leniency Summary (to return string) ---
+def generate_targeted_sentiment_visual_str(summary_data, max_bar_width=30):
+    output_lines = []
+    output_lines.append("--- Targeted Sentiment Distribution Visual ---")
 
     if not summary_data or not summary_data.get("by_entity"):
-        print("No targeted sentiment data available to generate a visual summary.")
-        return
+        output_lines.append("No targeted sentiment data available to generate a visual summary.")
+        return "\n".join(output_lines)
 
     data_by_entity = summary_data["by_entity"]
     overall_stats = summary_data.get("overall_stats", {})
-
     entities_with_comments = {
         entity: data for entity, data in data_by_entity.items() if data.get("comment_count", 0) > 0
     }
 
     if not entities_with_comments:
-        print("No comments were found primarily targeting any specific entities for visualization.")
-        print(f"(Overall Valid Analyses: {overall_stats.get('valid_analyses',0)})")
-        return
+        output_lines.append("No comments were found primarily targeting any specific entities for visualization.")
+        output_lines.append(f"(Overall Valid Analyses: {overall_stats.get('valid_analyses',0)})")
+        return "\n".join(output_lines)
 
-    print(f"Overall Valid Analyses: {overall_stats.get('valid_analyses',0)}, "
-          f"Total Sarcastic Comments: {overall_stats.get('total_sarcastic_comments_overall',0)}")
+    output_lines.append(f"Overall Valid Analyses: {overall_stats.get('valid_analyses',0)}, "
+                        f"Total Sarcastic Comments: {overall_stats.get('total_sarcastic_comments_overall',0)}")
 
     sentiment_labels = ["Positive", "Negative", "Neutral"]
     max_sentiment_label_len = max(len(label) for label in sentiment_labels)
 
     for entity_name, entity_data in entities_with_comments.items():
         avg_score_display = f"{entity_data['average_sentiment_score']:.2f}" if entity_data['valid_score_count'] > 0 else "N/A"
-        print(f"\n{entity_name}: "
-              f"({entity_data['comment_count']} comments, "
-              f"{entity_data['sarcastic_count']} sarcastic, "
-              f"Avg Score: {avg_score_display})")
+        output_lines.append(f"\n{entity_name}: "
+                            f"({entity_data['comment_count']} comments, "
+                            f"{entity_data['sarcastic_count']} sarcastic, "
+                            f"Avg Score: {avg_score_display})")
 
         sentiments_to_display = {
             "Positive": entity_data.get("positive", 0),
             "Negative": entity_data.get("negative", 0),
             "Neutral":  entity_data.get("neutral", 0)
         }
-        
         total_classified_for_entity = sum(sentiments_to_display.values())
-
         if total_classified_for_entity == 0:
-            print("    No classified sentiments (positive/negative/neutral) for this entity.")
+            output_lines.append("    No classified sentiments (positive/negative/neutral) for this entity.")
             continue
 
-        # Determine the maximum count among the sentiment categories for this entity for scaling bars
-        max_count_for_entity_bar_scaling = 0
-        counts_for_entity = [c for c in sentiments_to_display.values() if isinstance(c, int) and c > 0]
-        if counts_for_entity:
-            max_count_for_entity_bar_scaling = max(counts_for_entity)
+        max_count_for_entity_bar_scaling = max(c for c in sentiments_to_display.values() if isinstance(c, int) and c > 0) if \
+                                           any(c > 0 for c in sentiments_to_display.values() if isinstance(c,int)) else 1 # Avoid div by zero
         
-        # Define line length for the chart for this entity
         line_len = max_sentiment_label_len + 3 + max_bar_width + 3 + 5 + 10 
-        print("  " + "-" * line_len)
+        output_lines.append("  " + "-" * line_len)
 
         for sentiment_label, count_val in sentiments_to_display.items():
             percentage = (count_val / total_classified_for_entity * 100) if total_classified_for_entity > 0 else 0.0
-            
-            if max_count_for_entity_bar_scaling > 0: # Avoid division by zero
-                bar_length = int((count_val / max_count_for_entity_bar_scaling) * max_bar_width)
-            else: # If max_count is 0, all counts for this entity are 0 for pos/neg/neu
-                bar_length = 0
-                
-            bar_char = '█' # U+2588 FULL BLOCK
+            bar_length = int((count_val / max_count_for_entity_bar_scaling) * max_bar_width) if max_count_for_entity_bar_scaling > 0 else 0
+            bar_char = '█'
             bar = bar_char * bar_length
             padding = ' ' * (max_bar_width - bar_length)
-            
-            # Indent sentiment bars under the entity name
-            print(f"  {sentiment_label:<{max_sentiment_label_len}} [{bar}{padding}] {count_val:>4} ({percentage:>5.1f}%)")
-        print("  " + "-" * line_len)
+            output_lines.append(f"  {sentiment_label:<{max_sentiment_label_len}} [{bar}{padding}] {count_val:>4} ({percentage:>5.1f}%)")
+        output_lines.append("  " + "-" * line_len)
         
-    print("\n--- End of Visual Summary ---")
-
-# --- Main Orchestration ---
-if __name__ == '__main__':
-    # --- Configuration ---
-    INPUT_CHANNEL_ID = ""
-    # Prompt for Channel ID if not hardcoded
-    while not INPUT_CHANNEL_ID.startswith("UC") or len(INPUT_CHANNEL_ID) < 10: # Basic validation
-        INPUT_CHANNEL_ID = input("Please enter the YouTube Channel ID (starts with UC, e.g., UCXXXX...): ").strip()
-        if not INPUT_CHANNEL_ID.startswith("UC"):
-            print("Invalid Channel ID format. It must start with 'UC'.")
-        elif len(INPUT_CHANNEL_ID) < 10: # Arbitrary minimum length, typical IDs are longer
-             print("Channel ID seems too short. Please re-enter.")
+    output_lines.append("\n--- End of Visual Summary ---")
+    return "\n".join(output_lines)
 
 
-    MAX_VIDEOS_TO_SCAN_FROM_CHANNEL = 20 # Reduced for quicker testing, adjust as needed
-    COMMENTS_TO_ANALYZE_PER_VIDEO_COUNT = 100 # Or 'all'
+# --- Main Orchestration Logic ---
+def main():
+    global EFFECTIVE_YOUTUBE_API_KEY, EFFECTIVE_FIREWORKS_API_KEY # Allow modification of globals
 
-    # --- Initial Checks ---
-    if not YOUTUBE_API_KEY: print("Error: YOUTUBE_API_KEY not found in environment variables or .env file.")
-    if not FIREWORKS_API_KEY: print("Error: FIREWORKS_API_KEY not found. AI functions will be skipped or fail.")
+    parser = argparse.ArgumentParser(description="YouTube Video Scraper and Analyzer for Political Sentiment.")
+    parser.add_argument("--action", choices=["fetch_videos", "analyze_videos"], required=True,
+                        help="Action to perform: fetch video list or analyze videos.")
+    parser.add_argument("--channel-id", help="YouTube Channel ID (for fetch_videos).")
+    parser.add_argument("--youtube-api-key", help="YouTube API Key (overrides .env).")
+    parser.add_argument("--fireworks-api-key", help="Fireworks API Key (overrides .env).")
+    parser.add_argument("--max-videos-scan", type=int, default=20,
+                        help="Maximum number of recent videos to scan from the channel (for fetch_videos).")
+    parser.add_argument("--input-file", help="Path to JSON file containing video list (for analyze_videos).")
+    parser.add_argument("--output-dir", default="analysis_results_scraper",
+                        help="Directory to save analysis results (for analyze_videos).")
+    parser.add_argument("--comments-to-analyze", default="100", # String, can be "all" or number
+                        help="Number of comments to analyze per video, or 'all' (for analyze_videos).")
+    
+    args = parser.parse_args()
 
-    if not YOUTUBE_API_KEY: # Fireworks key is checked within functions
-        print("Exiting due to missing YouTube API key.")
-        exit()
+    # Set effective API keys
+    EFFECTIVE_YOUTUBE_API_KEY = args.youtube_api_key if args.youtube_api_key else _YOUTUBE_API_KEY_FROM_ENV
+    EFFECTIVE_FIREWORKS_API_KEY = args.fireworks_api_key if args.fireworks_api_key else _FIREWORKS_API_KEY_FROM_ENV
 
-    # --- Agent 0: Fetch & Filter Politics-Related Videos ---
-    politics_related_videos = agent0_fetch_and_filter_videos(
-        INPUT_CHANNEL_ID, YOUTUBE_API_KEY, FIREWORKS_API_KEY, MAX_VIDEOS_TO_SCAN_FROM_CHANNEL
-    )
-
-    if not politics_related_videos:
-        print("No politics-related videos found or an error occurred with Agent 0. Exiting.")
-        exit()
-
-    print("\n--- Politics-Related Videos Found by Agent 0 ---")
-    for i, video in enumerate(politics_related_videos):
-        print(f"{i+1}. {video.get('title')} (ID: {video.get('video_id')})")
-        print(f"   Reason: {video.get('reasoning_for_political', 'N/A')}")
-        print(f"   URL: {video.get('url')}")
-
-
-    # --- User Selection of Videos to Process ---
-    videos_to_process_fully = []
-    if not politics_related_videos: # Should have exited above, but defensive check
-        print("No videos to select from. Exiting.")
-        exit()
-
-    while True:
-        user_choice_str = input(f"\nEnter video number (1-{len(politics_related_videos)}) to process, "
-                                f"'all' for all {len(politics_related_videos)} listed, or 'quit': ").strip().lower()
-        if user_choice_str == 'quit':
-            print("Exiting.")
-            exit()
-        elif user_choice_str == 'all':
-            videos_to_process_fully = politics_related_videos
-            print(f"Selected all {len(videos_to_process_fully)} videos for full analysis.")
-            break
-        else:
-            try:
-                choice_index = int(user_choice_str) - 1
-                if 0 <= choice_index < len(politics_related_videos):
-                    selected_video = politics_related_videos[choice_index]
-                    videos_to_process_fully.append(selected_video)
-                    print(f"Added video: {selected_video.get('title')} to processing queue.")
-                    # Ask if user wants to add more, or process now
-                    add_more = input("Add another video? (yes/no/all/quit): ").strip().lower()
-                    if add_more == 'no' or add_more == 'quit':
-                        break
-                    elif add_more == 'all':
-                        videos_to_process_fully = politics_related_videos
-                        print(f"Selected all {len(videos_to_process_fully)} videos for full analysis.")
-                        break
-                    # If 'yes' or anything else, the loop continues to ask for another number
-                else:
-                    print(f"Invalid video number. Please enter a number between 1 and {len(politics_related_videos)}.")
-            except ValueError:
-                print("Invalid input. Please enter a number, 'all', or 'quit'.")
-
-    if not videos_to_process_fully:
-        print("No videos selected for processing. Exiting.")
-        exit()
-
-    print(f"\n--- Starting full analysis for {len(videos_to_process_fully)} selected video(s) ---")
+    if not EFFECTIVE_YOUTUBE_API_KEY:
+        print("Error: YouTube API Key is required, either via --youtube-api-key or .env file (YOUTUBE_API_KEY).", file=sys.stderr)
+        # For fetch_videos, it's critical. For analyze_videos, it's also critical for fetching comments.
+        sys.exit(1)
+    # Fireworks API key is optional; features will be skipped if not provided.
+    if not EFFECTIVE_FIREWORKS_API_KEY:
+        print("Warning: Fireworks API Key is not set (via --fireworks-api-key or .env FIREWORKS_API_KEY). AI-based features (filtering, transcription, summary, sentiment) will be skipped or may fail.", file=sys.stderr)
 
 
-    # --- Main Processing Loop for Selected Videos ---
-    grand_total_analyzed_comments_data = []
-
-    for video_idx, video_info_from_agent0 in enumerate(videos_to_process_fully):
-        current_video_url = video_info_from_agent0.get("url")
-        current_video_id = video_info_from_agent0.get("video_id") # Get ID for folder name
-        current_video_title_from_agent0 = video_info_from_agent0.get("title", f"Unknown_Video_{current_video_id or 'NoID'}")
-
-        print(f"\n\n=== Processing Video {video_idx + 1}/{len(videos_to_process_fully)}: {current_video_title_from_agent0} ===")
-        print(f"URL: {current_video_url}")
-
-        # Fetch details again for consistency, though Agent0 provides some
-        video_details_api = fetch_youtube_video_details_and_comments_api(current_video_url, YOUTUBE_API_KEY)
-        # Prefer API title if available and different from Agent0's (which might be truncated or slightly off)
-        video_title_for_processing = video_details_api.get('title') if video_details_api.get('title') else current_video_title_from_agent0
-        video_description_for_processing = video_details_api.get('description')
-        original_comments_from_api = video_details_api.get('comments_data', [])
-
-        # --- Folder Setup ---
-        base_download_parent_folder = "analysis_data" # Changed folder name
-        # Sanitize title for folder name, include video ID for uniqueness
-        sanitized_title_part = re.sub(r'[^\w\s-]', '', video_title_for_processing).strip().replace(' ', '_')
-        sanitized_title_part = sanitized_title_part[:60] if sanitized_title_part else "Video" # Shorter part
+    if args.action == "fetch_videos":
+        if not args.channel_id:
+            print("Error: --channel-id is required for fetch_videos action.", file=sys.stderr)
+            sys.exit(1)
         
-        # Use video ID for folder name to ensure uniqueness and avoid issues with long/special char titles
-        video_id_for_folder = current_video_id if current_video_id else "UnknownID"
-        unique_video_folder_name = f"{video_id_for_folder}_{sanitized_title_part}"
+        political_videos_data = agent0_fetch_and_filter_videos(
+            args.channel_id, 
+            EFFECTIVE_YOUTUBE_API_KEY, 
+            EFFECTIVE_FIREWORKS_API_KEY, 
+            args.max_videos_scan
+        )
+        # Output JSON to stdout for gui_app.py
+        print(json.dumps(political_videos_data, indent=4))
 
-        output_video_data_folder = os.path.join(base_download_parent_folder, unique_video_folder_name)
+    elif args.action == "analyze_videos":
+        if not args.input_file:
+            print("Error: --input-file is required for analyze_videos action.", file=sys.stderr)
+            sys.exit(1)
+        
         try:
-            os.makedirs(output_video_data_folder, exist_ok=True)
-            print(f"Data for this video will be saved in: {os.path.abspath(output_video_data_folder)}")
-        except OSError as e:
-            print(f"Error creating output directory '{output_video_data_folder}': {e}. Skipping this video.")
-            continue
+            with open(args.input_file, 'r', encoding='utf-8') as f:
+                videos_to_process_fully = json.load(f)
+        except Exception as e:
+            print(f"Error reading input file {args.input_file}: {e}", file=sys.stderr)
+            sys.exit(1)
 
-        # Save initial video info
-        save_data_to_file({"title": video_title_for_processing, "description": video_description_for_processing, "url": current_video_url, "id": current_video_id},
-                          output_video_data_folder, "video_meta.json")
-        if original_comments_from_api:
-            save_data_to_file(original_comments_from_api, output_video_data_folder, "original_comments.json")
-        else:
-            print("No comments found via API for this video.")
+        if not videos_to_process_fully:
+            print("No videos found in the input file to analyze.", file=sys.stderr)
+            sys.exit(0)
 
+        os.makedirs(args.output_dir, exist_ok=True)
+        grand_total_analyzed_comments_data = []
 
-        transcribed_text = None
-        contextual_summary = None
-        # mp3_file_path = None # Declared later
+        comments_to_analyze_val_str = args.comments_to_analyze.strip()
+        # fetch_youtube_video_details_and_comments_api will handle parsing this string
 
-        if FIREWORKS_API_KEY: # Only proceed if key exists
-            print(f"\n--- Downloading & Transcribing Audio for '{video_title_for_processing}' ---")
-            # Use a fixed name for the audio file within its video-specific folder
-            mp3_file_path = download_audio_mp3_yt_dlp(current_video_url, output_video_data_folder, filename_template='audio_track.%(ext)s')
-            if mp3_file_path and os.path.exists(mp3_file_path):
-                transcribed_text = transcribe_audio_fireworks(mp3_file_path, FIREWORKS_API_KEY)
-                if transcribed_text:
-                    save_data_to_file(transcribed_text, output_video_data_folder, "transcription.txt")
-                else:
-                    print("Transcription failed or returned empty.")
-            else:
-                print(f"Audio download failed for {current_video_url}, skipping transcription.")
-        else:
-            print("Skipping audio download and transcription as FIREWORKS_API_KEY is not set.")
+        for video_idx, video_info_from_input in enumerate(videos_to_process_fully):
+            current_video_url = video_info_from_input.get("url")
+            current_video_id = video_info_from_input.get("video_id")
+            current_video_title_from_input = video_info_from_input.get("title", f"Unknown_Video_{current_video_id or 'NoID'}")
 
-        if transcribed_text and FIREWORKS_API_KEY:
-            print("\n--- Generating Contextual Summary (Agent 2) ---")
-            contextual_summary = generate_contextual_summary_langchain(
-                transcribed_text, video_title_for_processing, video_description_for_processing, FIREWORKS_API_KEY
+            print(f"\n\n=== Processing Video {video_idx + 1}/{len(videos_to_process_fully)}: {current_video_title_from_input} (ID: {current_video_id}) ===", file=sys.stderr)
+            print(f"URL: {current_video_url}", file=sys.stderr)
+
+            # Fetch details & comments (pass EFFECTIVE_YOUTUBE_API_KEY and comments_to_analyze_val_str)
+            video_details_api = fetch_youtube_video_details_and_comments_api(
+                current_video_url, 
+                EFFECTIVE_YOUTUBE_API_KEY,
+                comments_to_analyze_val_str # Pass the count/ "all" string here
             )
-            if contextual_summary:
-                save_data_to_file(contextual_summary, output_video_data_folder, "contextual_summary.txt")
-            else:
-                print("Contextual summary generation failed or returned empty.")
-        elif FIREWORKS_API_KEY: # If key exists but no transcription
-             print("Skipping contextual summary as transcription is unavailable.")
-
-
-        if original_comments_from_api and FIREWORKS_API_KEY:
-            print("\n--- Analyzing Comments for Political Leniency & Sarcasm (Agent 3) ---")
-            analyzed_comments_for_this_video = []
+            video_title_for_processing = video_details_api.get('title') if video_details_api.get('title') else current_video_title_from_input
+            video_description_for_processing = video_details_api.get('description')
+            original_comments_from_api = video_details_api.get('comments_data', [])
             
-            comments_to_process_for_video = []
-            if isinstance(COMMENTS_TO_ANALYZE_PER_VIDEO_COUNT, str) and COMMENTS_TO_ANALYZE_PER_VIDEO_COUNT.lower() == 'all':
-                comments_to_process_for_video = original_comments_from_api
-            elif isinstance(COMMENTS_TO_ANALYZE_PER_VIDEO_COUNT, int) and COMMENTS_TO_ANALYZE_PER_VIDEO_COUNT > 0:
-                comments_to_process_for_video = original_comments_from_api[:COMMENTS_TO_ANALYZE_PER_VIDEO_COUNT]
+            # --- Folder Setup ---
+            sanitized_title_part = re.sub(r'[^\w\s-]', '', video_title_for_processing).strip().replace(' ', '_')
+            sanitized_title_part = sanitized_title_part[:60] if sanitized_title_part else "Video"
+            video_id_for_folder = current_video_id if current_video_id else "UnknownID"
+            unique_video_folder_name = f"{video_id_for_folder}_{sanitized_title_part}"
+            output_video_data_folder = os.path.join(args.output_dir, unique_video_folder_name)
             
-            if comments_to_process_for_video:
-                print(f"Analyzing {len(comments_to_process_for_video)} comments for this video...")
-                for i, comment_obj in enumerate(comments_to_process_for_video):
-                    if not comment_obj or not isinstance(comment_obj.get('comment_text'), str) or not comment_obj.get('comment_text').strip():
-                        print(f"  Skipping invalid or empty comment object at index {i}.")
-                        analysis_error_obj = {"comment_text": str(comment_obj.get('comment_text', 'INVALID_COMMENT_DATA')), "is_sarcastic": False, "sarcasm_reasoning": "N/A - Invalid/Empty Comment Data",
-                                            "political_entity_lean": "Error", "leniency_score_percent": 0.0,
-                                            "reasoning": "Invalid or empty comment data provided to analysis."}
-                        analyzed_comments_for_this_video.append(analysis_error_obj)
-                        # grand_total_analyzed_comments_data.append(analysis_error_obj) # Add error to grand total
-                        continue
-
-                    print(f"  Analyzing comment {i+1}/{len(comments_to_process_for_video)}: \"{comment_obj.get('comment_text', '')[:60].replace(os.linesep, ' ')}...\"")
-                    # time.sleep(0.5) # Rate limit before LLM call
-                    analysis_result = analyze_comment_sentiment_analysis_langchain(
-                        comment_obj, contextual_summary, video_title_for_processing, video_description_for_processing, FIREWORKS_API_KEY
-                    )
-                    analyzed_comments_for_this_video.append(analysis_result)
-                    # grand_total_analyzed_comments_data.append(analysis_result) # Add to grand total immediately
-                    time.sleep(1) # Rate limiting for LLM calls
-
-                if analyzed_comments_for_this_video:
-                    save_data_to_file(analyzed_comments_for_this_video, output_video_data_folder, "political_leniency_analysis.json")
-                    print(f"  Finished analysis for {len(analyzed_comments_for_this_video)} comments for this video.")
-                    grand_total_analyzed_comments_data.extend(analyzed_comments_for_this_video) # Add all results for this video to grand total
-            else:
-                print(f"No comments selected for analysis for this video (config: {COMMENTS_TO_ANALYZE_PER_VIDEO_COUNT}).")
-        elif FIREWORKS_API_KEY: # Key exists but no comments
-            print("Skipping comment analysis as no comments were fetched or FIREWORKS_API_KEY is missing.")
-        
-        print(f"\n=== Finished processing video: {video_title_for_processing} ===")
-        if video_idx < len(videos_to_process_fully) - 1:
-            print("--- Waiting briefly before next video ---")
-            time.sleep(5) # Brief pause between processing different videos
-
-    # --- Display Overall Leniency Visual & Summary (after all selected videos are processed) ---
-# --- Display Overall Sentiment Summary & Visual (after all selected videos are processed) ---
-    if grand_total_analyzed_comments_data: # Ensure this list holds results from the targeted sentiment analysis function
-        print("\n\n========================================================")
-        print("       OVERALL COMBINED TARGETED SENTIMENT ANALYSIS RESULTS")
-        print("========================================================")
-        
-        # Calculate and print the detailed targeted sentiment summary
-        targeted_sentiment_summary_results = calculate_targeted_sentiment_summary(
-            grand_total_analyzed_comments_data, 
-            title="Grand Total (All Selected Videos) Targeted Sentiment"
-        )
-        
-        # Generate and display the visual representation of the targeted sentiment distribution
-        # Check if there's valid data in the summary before trying to visualize
-        if (targeted_sentiment_summary_results and 
-            targeted_sentiment_summary_results.get("overall_stats", {}).get("valid_analyses", 0) > 0):
-            generate_and_display_targeted_sentiment_visual(targeted_sentiment_summary_results)
-        else:
-            print("\nNo valid targeted sentiment data was processed to display a visual summary.")
-            
-    else:
-        print("\nNo comments were analyzed across all selected videos, so no overall targeted sentiment summary to display.")
-
-    print("\nAll selected videos processed. Script finished.")
-    # Ensure base_download_parent_folder is defined if you use this print statement
-    # print(f"All data saved in subfolders within: {os.path.abspath(base_download_parent_folder)}")
-    print(f"All data saved in subfolders within: {os.path.abspath(base_download_parent_folder)}")
-
-def main_cli_runner():
-    # --- Configuration ---
-    INPUT_CHANNEL_ID = ""
-    # Prompt for Channel ID if not hardcoded
-    while not INPUT_CHANNEL_ID.startswith("UC") or len(INPUT_CHANNEL_ID) < 10: # Basic validation
-        INPUT_CHANNEL_ID = input("Please enter the YouTube Channel ID (starts with UC, e.g., UCXXXX...): ").strip()
-        if not INPUT_CHANNEL_ID.startswith("UC"):
-            print("Invalid Channel ID format. It must start with 'UC'.")
-        elif len(INPUT_CHANNEL_ID) < 10: # Arbitrary minimum length, typical IDs are longer
-             print("Channel ID seems too short. Please re-enter.")
-
-
-    MAX_VIDEOS_TO_SCAN_FROM_CHANNEL = 20 # Reduced for quicker testing, adjust as needed
-    COMMENTS_TO_ANALYZE_PER_VIDEO_COUNT = 100 # Or 'all'
-
-    # --- Initial Checks ---
-    # These are global for the CLI runner, but functions should take them as params
-    if not YOUTUBE_API_KEY: print("Error: YOUTUBE_API_KEY not found in environment variables or .env file.")
-    if not FIREWORKS_API_KEY: print("Error: FIREWORKS_API_KEY not found. AI functions will be skipped or fail.")
-
-    if not YOUTUBE_API_KEY: # Fireworks key is checked within functions
-        print("Exiting due to missing YouTube API key.")
-        exit()
-
-    # --- Agent 0: Fetch & Filter Politics-Related Videos ---
-    politics_related_videos = agent0_fetch_and_filter_videos(
-        INPUT_CHANNEL_ID, YOUTUBE_API_KEY, FIREWORKS_API_KEY, MAX_VIDEOS_TO_SCAN_FROM_CHANNEL
-    )
-
-    if not politics_related_videos:
-        print("No politics-related videos found or an error occurred with Agent 0. Exiting.")
-        exit()
-
-    print("\n--- Politics-Related Videos Found by Agent 0 ---")
-    for i, video in enumerate(politics_related_videos):
-        print(f"{i+1}. {video.get('title')} (ID: {video.get('video_id')})")
-        print(f"   Reason: {video.get('reasoning_for_political', 'N/A')}")
-        print(f"   URL: {video.get('url')}")
-
-
-    # --- User Selection of Videos to Process ---
-    videos_to_process_fully = []
-    if not politics_related_videos: # Should have exited above, but defensive check
-        print("No videos to select from. Exiting.")
-        exit()
-
-    while True:
-        user_choice_str = input(f"\nEnter video number (1-{len(politics_related_videos)}) to process, "
-                                f"'all' for all {len(politics_related_videos)} listed, or 'quit': ").strip().lower()
-        if user_choice_str == 'quit':
-            print("Exiting.")
-            exit()
-        elif user_choice_str == 'all':
-            videos_to_process_fully = politics_related_videos
-            print(f"Selected all {len(videos_to_process_fully)} videos for full analysis.")
-            break
-        else:
             try:
-                choice_index = int(user_choice_str) - 1
-                if 0 <= choice_index < len(politics_related_videos):
-                    selected_video = politics_related_videos[choice_index]
-                    videos_to_process_fully.append(selected_video)
-                    print(f"Added video: {selected_video.get('title')} to processing queue.")
-                    # Ask if user wants to add more, or process now
-                    add_more = input("Add another video? (yes/no/all/quit): ").strip().lower()
-                    if add_more == 'no' or add_more == 'quit':
-                        break
-                    elif add_more == 'all':
-                        videos_to_process_fully = politics_related_videos
-                        print(f"Selected all {len(videos_to_process_fully)} videos for full analysis.")
-                        break
-                    # If 'yes' or anything else, the loop continues to ask for another number
+                os.makedirs(output_video_data_folder, exist_ok=True)
+                print(f"Data for this video will be saved in: {os.path.abspath(output_video_data_folder)}", file=sys.stderr)
+            except OSError as e:
+                print(f"Error creating output directory '{output_video_data_folder}': {e}. Skipping this video.", file=sys.stderr)
+                continue
+
+            save_data_to_file({"title": video_title_for_processing, "description": video_description_for_processing, "url": current_video_url, "id": current_video_id},
+                              output_video_data_folder, "video_meta.json")
+            if original_comments_from_api:
+                save_data_to_file(original_comments_from_api, output_video_data_folder, "original_comments.json")
+            else:
+                print("No comments found via API or to process for this video.", file=sys.stderr)
+
+            transcribed_text = None
+            contextual_summary = None
+
+            if EFFECTIVE_FIREWORKS_API_KEY: # Only proceed if key exists
+                print(f"\n--- Downloading & Transcribing Audio for '{video_title_for_processing}' ---", file=sys.stderr)
+                mp3_file_path = download_audio_mp3_yt_dlp(current_video_url, output_video_data_folder, filename_template='audio_track.%(ext)s')
+                if mp3_file_path and os.path.exists(mp3_file_path):
+                    transcribed_text = transcribe_audio_fireworks(mp3_file_path, EFFECTIVE_FIREWORKS_API_KEY)
+                    if transcribed_text:
+                        save_data_to_file(transcribed_text, output_video_data_folder, "transcription.txt")
+                    else:
+                        print("Transcription failed or returned empty.", file=sys.stderr)
                 else:
-                    print(f"Invalid video number. Please enter a number between 1 and {len(politics_related_videos)}.")
-            except ValueError:
-                print("Invalid input. Please enter a number, 'all', or 'quit'.")
+                    print(f"Audio download failed for {current_video_url}, skipping transcription.", file=sys.stderr)
 
-    if not videos_to_process_fully:
-        print("No videos selected for processing. Exiting.")
-        exit()
+                if transcribed_text:
+                    print("\n--- Generating Contextual Summary (Agent 2) ---", file=sys.stderr)
+                    contextual_summary = generate_contextual_summary_langchain(
+                        transcribed_text, video_title_for_processing, video_description_for_processing, EFFECTIVE_FIREWORKS_API_KEY
+                    )
+                    if contextual_summary:
+                        save_data_to_file(contextual_summary, output_video_data_folder, "contextual_summary.txt")
+                    else:
+                        print("Contextual summary generation failed or returned empty.", file=sys.stderr)
+                elif EFFECTIVE_FIREWORKS_API_KEY : # Key exists but no transcription
+                    print("Skipping contextual summary as transcription is unavailable.", file=sys.stderr)
+            else: # No Fireworks key
+                print("Skipping audio download, transcription, and contextual summary as FIREWORKS_API_KEY is not set.", file=sys.stderr)
 
-    print(f"\n--- Starting full analysis for {len(videos_to_process_fully)} selected video(s) ---")
 
+            if original_comments_from_api and EFFECTIVE_FIREWORKS_API_KEY:
+                print("\n--- Analyzing Comments for Targeted Sentiment (Agent 3) ---", file=sys.stderr)
+                analyzed_comments_for_this_video = []
+                
+                # `original_comments_from_api` already respects `comments_to_analyze_val_str` via `Workspace_youtube_video_details_and_comments_api`
+                comments_to_process_for_video_llm = original_comments_from_api
+                
+                if comments_to_process_for_video_llm:
+                    print(f"Analyzing {len(comments_to_process_for_video_llm)} comments for this video with LLM...", file=sys.stderr)
+                    for i, comment_obj in enumerate(comments_to_process_for_video_llm):
+                        if not comment_obj or not isinstance(comment_obj.get('comment_text'), str) or not comment_obj.get('comment_text').strip():
+                            print(f"  Skipping invalid or empty comment object at index {i}.", file=sys.stderr)
+                            analysis_error_obj = {"comment_text": str(comment_obj.get('comment_text', 'INVALID_COMMENT_DATA')), "is_sarcastic": False, "sarcasm_reasoning": "N/A - Invalid/Empty Comment Data",
+                                                "primary_target_entity": "General Comment/No Specific Listed Entity", 
+                                                "entity_identification_reasoning": "N/A - Invalid Comment Data",
+                                                "sentiment_expressed": "neutral", "sentiment_score": 0.0,
+                                                "overall_reasoning": "Invalid or empty comment data provided to analysis."}
+                            analyzed_comments_for_this_video.append(analysis_error_obj)
+                            continue
 
-    # --- Main Processing Loop for Selected Videos ---
-    grand_total_analyzed_comments_data = []
-    # Define base_download_parent_folder for the CLI runner context
-    base_download_parent_folder_cli = "analysis_data_cli" 
-    os.makedirs(base_download_parent_folder_cli, exist_ok=True)
+                        print(f"  Analyzing comment {i+1}/{len(comments_to_process_for_video_llm)}: \"{comment_obj.get('comment_text', '')[:60].replace(os.linesep, ' ')}...\"", file=sys.stderr)
+                        analysis_result = analyze_comment_sentiment_analysis_langchain(
+                            comment_obj, contextual_summary, video_title_for_processing, video_description_for_processing, EFFECTIVE_FIREWORKS_API_KEY
+                        )
+                        analyzed_comments_for_this_video.append(analysis_result)
+                        time.sleep(1) # Rate limiting for LLM calls
 
+                    if analyzed_comments_for_this_video:
+                        # Save as targeted_sentiment_analysis.json as expected by GUI
+                        save_data_to_file(analyzed_comments_for_this_video, output_video_data_folder, "targeted_sentiment_analysis.json")
+                        print(f"  Finished LLM analysis for {len(analyzed_comments_for_this_video)} comments for this video.", file=sys.stderr)
+                        grand_total_analyzed_comments_data.extend(analyzed_comments_for_this_video)
+                else:
+                     print(f"No comments were fetched or available to analyze with LLM for this video.", file=sys.stderr)
+            elif not EFFECTIVE_FIREWORKS_API_KEY:
+                print("Skipping LLM comment analysis as FIREWORKS_API_KEY is not set.", file=sys.stderr)
+            elif not original_comments_from_api:
+                 print("Skipping LLM comment analysis as no comments were fetched from API.", file=sys.stderr)
 
-    for video_idx, video_info_from_agent0 in enumerate(videos_to_process_fully):
-        print(f"\n\n=== CLI Processing Video {video_idx + 1}/{len(videos_to_process_fully)}: {video_info_from_agent0.get('title')} ===")
-        # Pass YOUTUBE_API_KEY and FIREWORKS_API_KEY which are in scope for main_cli_runner
-        video_processing_results = process_single_video(
-            video_info=video_info_from_agent0,
-            youtube_api_key=YOUTUBE_API_KEY, # Global for CLI context
-            fireworks_api_key=FIREWORKS_API_KEY, # Global for CLI context
-            comments_to_analyze_count=COMMENTS_TO_ANALYZE_PER_VIDEO_COUNT, # From CLI config
-            base_output_folder=base_download_parent_folder_cli # CLI specific output folder
-        )
-        if video_processing_results and video_processing_results.get("analyzed_comments"):
-            grand_total_analyzed_comments_data.extend(video_processing_results["analyzed_comments"])
-        
-        if video_idx < len(videos_to_process_fully) - 1:
-            print("--- CLI: Waiting briefly before next video ---")
-            time.sleep(5) # Brief pause between processing different videos
+            print(f"\n=== Finished processing video: {video_title_for_processing} ===", file=sys.stderr)
+            if video_idx < len(videos_to_process_fully) - 1:
+                print("--- Waiting briefly before next video ---", file=sys.stderr)
+                time.sleep(3) # Brief pause
 
-    # --- Display Overall Sentiment Summary & Visual (after all selected videos are processed) ---
-    if grand_total_analyzed_comments_data:
-        print("\n\n========================================================")
-        print("       CLI: OVERALL COMBINED TARGETED SENTIMENT ANALYSIS RESULTS")
-        print("========================================================")
-        
-        targeted_sentiment_summary_results = calculate_targeted_sentiment_summary(
-            grand_total_analyzed_comments_data, 
-            title="CLI Grand Total (All Selected Videos) Targeted Sentiment"
-        )
-        
-        if (targeted_sentiment_summary_results and 
-            targeted_sentiment_summary_results.get("overall_stats", {}).get("valid_analyses", 0) > 0):
-            generate_and_display_targeted_sentiment_visual(targeted_sentiment_summary_results)
-        else:
-            print("\nCLI: No valid targeted sentiment data was processed to display a visual summary.")
+        # After all videos are processed, generate and save overall summaries
+        if grand_total_analyzed_comments_data:
+            print("\n\n========================================================", file=sys.stderr)
+            print("       OVERALL COMBINED TARGETED SENTIMENT ANALYSIS RESULTS", file=sys.stderr)
+            print("========================================================", file=sys.stderr)
             
-    else:
-        print("\nCLI: No comments were analyzed across all selected videos, so no overall targeted sentiment summary to display.")
+            targeted_sentiment_summary_dict = calculate_targeted_sentiment_summary(
+                grand_total_analyzed_comments_data, 
+                title="Grand Total (All Selected Videos) Targeted Sentiment"
+            )
+            save_data_to_file(targeted_sentiment_summary_dict, args.output_dir, "overall_sentiment_summary.json")
+            
+            visual_summary_content = generate_targeted_sentiment_visual_str(targeted_sentiment_summary_dict)
+            save_data_to_file(visual_summary_content, args.output_dir, "overall_sentiment_visual.txt")
+        else:
+            print("\nNo comments were analyzed across all selected videos, so no overall targeted sentiment summary to display or save.", file=sys.stderr)
+            # Create empty summary files as GUI might expect them
+            save_data_to_file({"by_entity":{}, "overall_stats":{"total_analyzed_items":0, "valid_analyses":0, "total_sarcastic_comments_overall":0}}, args.output_dir, "overall_sentiment_summary.json")
+            save_data_to_file("No data to visualize.", args.output_dir, "overall_sentiment_visual.txt")
 
-    print("\nCLI: All selected videos processed. Script finished.")
-    print(f"CLI: All data saved in subfolders within: {os.path.abspath(base_download_parent_folder_cli)}")
 
+        print(f"\nAll selected videos processed. Results saved in {os.path.abspath(args.output_dir)}", file=sys.stderr)
 
 if __name__ == '__main__':
-    main_cli_runner()
+    main()
