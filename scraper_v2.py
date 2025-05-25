@@ -9,12 +9,17 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import argparse # Added
 import sys # Added
+import matplotlib
+matplotlib.use('Agg') # Use a non-interactive backend for saving plots without displaying them
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker # For formatting y-axis if needed
+import numpy as np # For bar chart positioning
 
 # Langchain and Fireworks AI specific imports
 from langchain_fireworks import ChatFireworks
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, confloat
 
 # For Fireworks AI Whisper transcription via OpenAI-compatible API
 import openai
@@ -41,11 +46,19 @@ MALAYSIAN_POLITICAL_ENTITIES = [
     "Other (Specify if clearly identifiable and not listed)",
     "Neutral/No clear leniency", "Unclear due to insufficient information"
 ]
+
 TARGETABLE_MALAYSIAN_POLITICAL_ENTITIES = [
-    "Pakatan Harapan (PH)", "Perikatan Nasional (PN)", "Barisan Nasional (BN)",
-    "Gabungan Parti Sarawak (GPS)", "Gabungan Rakyat Sabah (GRS)",
-    "Malaysian United Democratic Alliance (MUDA)", "Parti Sosialis Malaysia (PSM)",
-    "General Comment/No Specific Listed Entity"
+    "Parti Keadilan Rakyat (PKR)",
+    "Democratic Action Party (DAP)",
+    "Parti Amanah Negara (AMANAH)",
+    "United Malays National Organisation (UMNO)",
+    "Malaysian Islamic Party (PAS)",
+    "Parti Pribumi Bersatu Malaysia (BERSATU)",
+    "Gabungan Parti Sarawak (GPS)", # This is still a coalition, decide if you want its components
+    "Malaysian United Democratic Alliance (MUDA)",
+    "Parti Sosialis Malaysia (PSM)",
+    # Add other specific parties as needed
+    "General Comment/No Specific Listed Entity" # Keep this for general comments
 ]
 
 # --- Pydantic Models (TargetedCommentSentiment, PoliticalVideoCheck, etc. - unchanged) ---
@@ -53,6 +66,7 @@ class TargetedCommentSentiment(BaseModel):
     comment_text: str = Field(description="The original comment text.")
     is_sarcastic: bool = Field(description="True if the comment is sarcastic, False otherwise.")
     sarcasm_reasoning: str = Field(description="Brief explanation if sarcasm is detected, or 'N/A' if not sarcastic.")
+
     primary_target_entity: str = Field(
         description=(
             "The Malaysian political entity primarily targeted or discussed in the comment. "
@@ -64,6 +78,7 @@ class TargetedCommentSentiment(BaseModel):
     entity_identification_reasoning: str = Field(
         description="Brief reasoning for identifying the primary_target_entity, or for choosing 'General Comment/No Specific Listed Entity'."
     )
+
     sentiment_expressed: str = Field(
         description=(
             "The sentiment expressed towards the 'primary_target_entity'. If 'primary_target_entity' is "
@@ -71,11 +86,25 @@ class TargetedCommentSentiment(BaseModel):
             "Must be one of: 'positive', 'negative', 'neutral'."
         )
     )
-    sentiment_score: float = Field(
+    sentiment_score: confloat(ge=-1.0, le=1.0) = Field( # Using confloat for validation
         description=(
-            "A score from -1.0 (very negative) to 1.0 (very positive) for the 'sentiment_expressed', "
-            "with 0.0 representing neutral. This score should reflect the intensity of the sentiment. "
-            "Sarcasm should be factored in (e.g., if sarcasm inverts an apparently positive statement to express a negative sentiment towards the target)."
+            "A numerical score from -1.0 (very negative) to 1.0 (very positive) for the 'sentiment_expressed', "
+            "with 0.0 representing neutral. This score must precisely reflect the INTENSITY and NUANCE of the sentiment. "
+            "Sarcasm MUST be factored into this score (e.g., if sarcasm inverts an apparently positive statement to express a negative sentiment towards the target, the score should be negative)."
+        )
+    )
+    sentiment_score_reasoning: str = Field( # NEW FIELD for detailed justification
+        description=(
+            "Detailed step-by-step reasoning for how the 'sentiment_score' was derived. "
+            "This should analyze the comment's specific wording, emotional intensity, relevant context from the video (if applicable and provided), "
+            "and critically, how sarcasm (if any) influenced both the direction (positive/negative) and the magnitude (e.g., why -0.8 vs -0.3, or why +0.2 vs +0.7) of the score. "
+            "Explicitly mention the key phrases or indicators from the comment that led to this score."
+        )
+    )
+    sentiment_confidence: confloat(ge=0.0, le=1.0) = Field( # NEW FIELD for LLM's confidence
+        description=(
+            "A score from 0.0 (low confidence) to 1.0 (high confidence) indicating your certainty about the accuracy and nuance of the assigned "
+            "'sentiment_expressed' and 'sentiment_score'. If confidence is below 0.7, briefly state the reason for lower confidence within the 'sentiment_score_reasoning' field (e.g., ambiguity, subtle sarcasm, lack of context)."
         )
     )
     overall_reasoning: str = Field(
@@ -123,17 +152,64 @@ def save_data_to_file(data_content, output_folder_path, filename):
     except Exception as e:
         print(f"Error saving {filename} to {file_path}: {e}", file=sys.stderr)
 
+# In scraper_v2.py
+
 def clean_llm_json_output(raw_text: str) -> str:
-    text = raw_text.strip()
-    if text.startswith("```json"):
-        text = text[len("```json"):]
-    if text.endswith("```"):
-        text = text[:-len("```")]
-    json_start_index = text.find('{')
-    json_end_index = text.rfind('}')
-    if json_start_index != -1 and json_end_index != -1 and json_end_index > json_start_index:
-        text = text[json_start_index : json_end_index + 1]
-    return text.strip()
+    # Step 1: Remove <think>...</think> tags and their content
+    text_after_think_removal = re.sub(r'<think>.*?</think>', '', raw_text, flags=re.DOTALL)
+    current_text = text_after_think_removal.strip()
+
+    # Step 2: Remove markdown ```json ... ``` tags
+    if current_text.startswith("```json"):
+        current_text = current_text[len("```json"):]
+    if current_text.endswith("```"):
+        current_text = current_text[:-len("```")]
+    current_text = current_text.strip()
+
+    if not current_text: # If empty after initial cleaning
+        # This can happen if the entire output was just <think> tags or markdown code fences
+        # print(f"DEBUG: LLM output empty after removing think/markdown tags. Original raw: '{raw_text[:200]}'", file=sys.stderr)
+        return ""
+
+    # Step 3: Attempt to extract the primary JSON object or array
+    first_brace_idx = current_text.find('{')
+    first_bracket_idx = current_text.find('[')
+    
+    start_index = -1
+    start_char_type = None
+    end_char_type = None
+
+    # Determine if the content likely starts with a JSON object or array
+    if first_brace_idx != -1 and (first_bracket_idx == -1 or first_brace_idx < first_bracket_idx):
+        start_index = first_brace_idx
+        start_char_type = '{'
+        end_char_type = '}'
+    elif first_bracket_idx != -1 and (first_brace_idx == -1 or first_bracket_idx < first_brace_idx):
+        start_index = first_bracket_idx
+        start_char_type = '['
+        end_char_type = ']'
+    
+    if start_index == -1: # No JSON starting character found in the remaining text
+        print(f"Warning: No JSON object/array starting character ('{{' or '[') found in LLM output after standard cleaning. Remaining text: '{current_text[:200]}'", file=sys.stderr)
+        return "" 
+
+    # Find the last corresponding closing character for the determined start character
+    end_index = current_text.rfind(end_char_type)
+
+    if end_index > start_index:
+        potential_json_str = current_text[start_index : end_index + 1]
+        # Validate if this extracted string is actually loadable JSON
+        try:
+            json.loads(potential_json_str) # Attempt to parse
+            return potential_json_str # It's valid JSON if loads() doesn't raise an error
+        except json.JSONDecodeError as e:
+            # The extracted substring is not valid JSON (e.g., truncated, syntax error within the supposed JSON)
+            print(f"Warning: Extracted potential JSON substring is not valid ({str(e)}). Extracted: '{potential_json_str[:200]}...'", file=sys.stderr)
+            return "" # Indicate failure to extract valid JSON
+    else:
+        # No valid end character found after the start character, or the structure is wrong (e.g., only an opening brace)
+        print(f"Warning: Could not form a plausible JSON structure (no valid end character '{end_char_type}' found correctly positioned or structure malformed). Remaining text: '{current_text[:200]}'", file=sys.stderr)
+        return ""
 
 # --- YouTube API Functions (Modified to use passed API key) ---
 def get_channel_uploads_playlist_id(youtube_service_object, channel_id): # Accepts youtube object
@@ -427,7 +503,7 @@ def filter_video_for_politics_llm(video_info, fireworks_api_key_to_use): # Param
                 "video_title": video_info.get("title"),
                 "video_id": video_info.get("video_id")}
 
-    llm = ChatFireworks(model="accounts/fireworks/models/llama4-maverick-instruct-basic", fireworks_api_key=fireworks_api_key_to_use, temperature=0.0, max_tokens=300) # Updated model
+    llm = ChatFireworks(model="accounts/fireworks/models/qwen3-235b-a22b", fireworks_api_key=fireworks_api_key_to_use, temperature=0.0, max_tokens=10000) # Updated model
     political_video_check_schema_dict = PoliticalVideoCheck.model_json_schema()
     political_video_check_schema_str = json.dumps(political_video_check_schema_dict, indent=2)
     escaped_political_video_check_schema = political_video_check_schema_str.replace("{", "{{").replace("}", "}}")
@@ -462,60 +538,70 @@ def filter_video_for_politics_llm(video_info, fireworks_api_key_to_use): # Param
     )
     prompt_template = ChatPromptTemplate.from_messages([("system", system_prompt), ("human", human_prompt)])
     # Use JsonOutputParser directly with the chain for Pydantic v2
-    chain_llm_part = prompt_template | llm | JsonOutputParser(pydantic_object=PoliticalVideoCheck)
+    # Define the chain to output a string first
+    chain_to_str_output = prompt_template | llm | StrOutputParser()
+    # Define the Pydantic-specific JSON parser
+    pydantic_json_parser = JsonOutputParser(pydantic_object=PoliticalVideoCheck) # Your Pydantic model
 
-    raw_llm_output_for_debug = "" # For debugging if parsing fails
+    raw_llm_string_for_debug = "" # For debugging
     try:
-        # parsed_output is what JsonOutputParser returns
-        parsed_output = chain_llm_part.invoke({
+        # 1. Get raw string output from LLM
+        raw_llm_string = chain_to_str_output.invoke({
             "video_title": video_info.get("title", ""),
-            "video_description": video_info.get("description", "")[:1000] # Limit description length
+            "video_description": video_info.get("description", "")[:1000]
         })
+        raw_llm_string_for_debug = raw_llm_string # Save for debugging
 
-        result_dict = None # Initialize
+        # 2. Clean the raw string output
+        cleaned_json_string = clean_llm_json_output(raw_llm_string)
 
-        if isinstance(parsed_output, dict):
-            result_dict = parsed_output # It's already a dict
-        elif isinstance(parsed_output, PoliticalVideoCheck): # PoliticalVideoCheck is your Pydantic model
-            # It's a Pydantic model instance, convert to dict
-            if hasattr(parsed_output, 'model_dump'): # Pydantic V2
-                result_dict = parsed_output.model_dump()
-            elif hasattr(parsed_output, 'dict'): # Pydantic V1
-                result_dict = parsed_output.dict()
+        if not cleaned_json_string.strip():
+            print(f"Error: LLM output was empty or invalid after cleaning for video '{video_info.get('title')}'. Raw output was: '{raw_llm_string[:500]}'", file=sys.stderr)
+            return {"is_political": False,
+                    "reasoning": "LLM output empty/invalid after cleaning think tags.",
+                    "video_title": video_info.get("title"),
+                    "video_id": video_info.get("video_id")}
+
+        # 3. Parse the cleaned string into the Pydantic model
+        parsed_model_instance = pydantic_json_parser.parse(cleaned_json_string)
+        # parsed_model_instance should now be an instance of PoliticalVideoCheck
+
+        result_dict = None
+
+        # 4. Convert Pydantic model instance to dictionary (handling V1/V2 Pydantic)
+        #    (This part is from the previous fix for the model_dump error)
+        if isinstance(parsed_model_instance, dict): # Should not happen if .parse() yields model
+            result_dict = parsed_model_instance
+            # print("Warning: JsonOutputParser.parse() returned a dict instead of Pydantic model. Proceeding with dict.", file=sys.stderr)
+        elif isinstance(parsed_model_instance, PoliticalVideoCheck): # Check against your specific model
+            if hasattr(parsed_model_instance, 'model_dump'): # Pydantic V2
+                result_dict = parsed_model_instance.model_dump()
+            elif hasattr(parsed_model_instance, 'dict'): # Pydantic V1
+                result_dict = parsed_model_instance.dict()
             else:
-                print(f"Error: Pydantic model {type(parsed_output)} has no model_dump/dict method.", file=sys.stderr)
-                # Fallback: create a dict with error info
-                result_dict = {"is_political": False, "reasoning": "Pydantic model conversion error"}
+                print(f"Error: Pydantic model {type(parsed_model_instance)} has no model_dump/dict method after parsing.", file=sys.stderr)
+                result_dict = {"is_political": False, "reasoning": "Pydantic model conversion error post-parse"}
         else:
-            print(f"Error: LLM JsonOutputParser returned unexpected type: {type(parsed_output)}", file=sys.stderr)
-            result_dict = {"is_political": False, "reasoning": f"LLM output parsing error, unexpected type: {type(parsed_output)}"}
+            # This case indicates .parse() might have failed or returned an unexpected type
+            print(f"Error: LLM JsonOutputParser.parse() returned unexpected type: {type(parsed_model_instance)} from cleaned string: '{cleaned_json_string[:200]}'", file=sys.stderr)
+            result_dict = {"is_political": False, "reasoning": f"LLM output parsing error, unexpected type post-parse: {type(parsed_model_instance)}"}
 
-        # Ensure the final dictionary has the required structure, including defaults if parsing failed partially
+        # Ensure the final dictionary has the required structure
         final_result = {
             "is_political": result_dict.get('is_political', False),
             "reasoning": result_dict.get('reasoning', "Reasoning missing or error during parsing."),
-            "video_title": video_info.get("title"), # Ensure these are always present
+            "video_title": video_info.get("title"),
             "video_id": video_info.get("video_id")
         }
         return final_result
 
     except Exception as e:
-        # This block catches other errors during the invoke() or if the above logic fails unexpectedly
-        str_parser_for_debug = StrOutputParser()
-        try:
-            # Attempt to get raw output for debugging if the chain invocation itself failed earlier
-            raw_llm_output_for_debug = (prompt_template | llm | str_parser_for_debug).invoke({
-                "video_title": video_info.get("title", ""),
-                "video_description": video_info.get("description", "")[:1000]
-            })
-        except Exception as dbg_e: # Catch errors during this debug attempt
-            raw_llm_output_for_debug = f"Could not retrieve raw LLM output for debugging. Debug error: {dbg_e}"
-
-        print(f"LLM filtering error for video '{video_info.get('title')}'. \nOriginal Error: {e}", file=sys.stderr)
-        print(f"Raw LLM output (if retrievable) that might have caused error:\n---\n{raw_llm_output_for_debug}\n---", file=sys.stderr)
-        # Return the standard error structure
+        # This block catches errors during invoke(), cleaning, or parsing
+        print(f"LLM filtering processing error for video '{video_info.get('title')}'. \nOriginal Error: {e}", file=sys.stderr)
+        # raw_llm_string_for_debug holds the output from the LLM before cleaning attempts
+        print(f"Raw LLM string output (before cleaning) that might have caused error:\n---\n{raw_llm_string_for_debug}\n---", file=sys.stderr)
         return {"is_political": False,
-                "reasoning": f"Error in LLM analysis: {e}. Raw output sample: {raw_llm_output_for_debug[:200]}...",
+                "reasoning": f"Error in LLM processing: {e}. Raw output sample: {raw_llm_string_for_debug[:200]}...",
                 "video_title": video_info.get("title"),
                 "video_id": video_info.get("video_id")}
 
@@ -608,7 +694,7 @@ def generate_contextual_summary_langchain(transcribed_text, video_title, video_d
         return "Contextual summary could not be generated due to missing transcription."
 
     print("Generating contextual summary (Langchain + Fireworks AI)...", file=sys.stderr)
-    llm = ChatFireworks(model="accounts/fireworks/models/llama4-maverick-instruct-basic", fireworks_api_key=fireworks_api_key_to_use, max_tokens=1024, temperature=0.3) # Updated model
+    llm = ChatFireworks(model="accounts/fireworks/models/qwen3-235b-a22b", fireworks_api_key=fireworks_api_key_to_use, max_tokens=10000, temperature=0.3) # Updated model
     prompt_template = ChatPromptTemplate.from_messages([
         ("system", (
             "You are an AI assistant tasked with creating a concise contextual summary of a YouTube video. "
@@ -638,41 +724,71 @@ def generate_contextual_summary_langchain(transcribed_text, video_title, video_d
         print(f"Summary generation error: {e}", file=sys.stderr)
     return None
 
-def analyze_comment_sentiment_analysis_langchain(comment, contextual_summary, video_title, video_description, fireworks_api_key_to_use): # Param updated
+def analyze_comment_sentiment_analysis_langchain(comment, contextual_summary, video_title, video_description, fireworks_api_key_to_use):
     if not fireworks_api_key_to_use:
         print("Fireworks API Key missing for targeted comment sentiment analysis.", file=sys.stderr)
+        # Return a structure matching TargetedCommentSentiment with an error
         return {
             "comment_text": comment.get('comment_text', "Error: API key missing"),
             "is_sarcastic": False, "sarcasm_reasoning": "N/A",
             "primary_target_entity": "General Comment/No Specific Listed Entity",
             "entity_identification_reasoning": "N/A - API Key Missing",
             "sentiment_expressed": "neutral", "sentiment_score": 0.0,
-            "overall_reasoning": "Error: Fireworks API Key missing."
+            "sentiment_score_reasoning": "Error: Fireworks API Key missing for analysis.",
+            "sentiment_confidence": 0.0
         }
 
-    llm = ChatFireworks(model="accounts/fireworks/models/llama4-maverick-instruct-basic", fireworks_api_key=fireworks_api_key_to_use, temperature=0.1, max_tokens=1024) # Updated model, max_tokens adjusted
+    # Ensure TARGETABLE_MALAYSIAN_POLITICAL_ENTITIES is defined globally or passed
+    # Ensure TargetedCommentSentiment model is defined globally or imported
+
+    # Regenerate the schema string based on your (potentially updated) TargetedCommentSentiment model
     targeted_sentiment_schema_dict = TargetedCommentSentiment.model_json_schema()
     targeted_sentiment_schema_str = json.dumps(targeted_sentiment_schema_dict, indent=2)
     escaped_targeted_sentiment_schema = targeted_sentiment_schema_str.replace("{", "{{").replace("}", "}}")
 
+    # --- Use the updated system prompt from the previous discussion ---
+    # --- (including the rubric for sentiment_score, and requests for ---
+    # ---  sentiment_score_reasoning and sentiment_confidence)     ---
     system_prompt = (
-        "You are an expert AI assistant specializing in Targeted Sentiment Analysis of YouTube comments, particularly those related to Malaysian politics. "
-        "You will be given a YouTube comment, along with the video's title, description, and a contextual summary. Your goal is to identify the primary political entity targeted by the comment (if any) and the sentiment expressed towards it. "
-        "Follow these steps carefully for the provided comment: "
-        "1. Identify Sarcasm: Determine if the comment ('comment_text') is sarcastic ('is_sarcastic': boolean). If true, briefly explain in 'sarcasm_reasoning'. "
-        "2. Identify Primary Target Entity: Determine the 'primary_target_entity' of the comment's sentiment. "
-        f"   - This entity MUST be chosen from the following exact list: {', '.join(TARGETABLE_MALAYSIAN_POLITICAL_ENTITIES)}. "
-        "   - If the comment expresses a general sentiment not directed at any single listed entity, or if it targets an individual or group not clearly representing one of the listed entities, you MUST use 'General Comment/No Specific Listed Entity'. "
-        "   - Provide your reasoning for this choice in 'entity_identification_reasoning'. "
-        "3. Determine Sentiment Towards Target: "
-        "   - Classify the 'sentiment_expressed' towards the identified 'primary_target_entity'. This sentiment MUST be one of: 'positive', 'negative', or 'neutral'. "
-        "   - Provide a 'sentiment_score' from -1.0 (intensely negative) to 1.0 (intensely positive), with 0.0 being neutral. This score should reflect the intensity of the 'sentiment_expressed'. "
-        "   - IMPORTANT: If sarcasm is detected, the 'sentiment_expressed' and 'sentiment_score' MUST reflect the true, underlying sarcastic meaning towards the target. "
-        "4. Explain Overall Judgment: Provide a brief 'overall_reasoning' (1-2 sentences) for your sentiment classification ('sentiment_expressed') and 'sentiment_score', specifically in relation to the 'primary_target_entity'. Explicitly state how any detected sarcasm influenced your final judgment. "
+        "You are an expert AI assistant specializing in advanced Targeted Sentiment Analysis of YouTube comments, particularly those related to Malaysian politics. Your analysis must be nuanced, transparent, and trustworthy. "
+        "You will be given a YouTube comment, along with the video's title, description, and a contextual summary. "
+        "Follow these steps meticulously for the provided comment: "
+        
+        "1.  **Identify Sarcasm**: Determine if the comment ('comment_text') is sarcastic ('is_sarcastic': boolean). If true, provide a concise 'sarcasm_reasoning'. If not, use 'N/A'. "
+        
+        "2.  **Identify Primary Target Entity**: Determine the 'primary_target_entity' of the comment's sentiment. "
+        f"    - This entity MUST be chosen from the following exact list: {', '.join(TARGETABLE_MALAYSIAN_POLITICAL_ENTITIES)}. "
+        
+        "    - **CRUCIAL MAPPING INSTRUCTION:** If the comment mentions a known political figure (e.g., by name, initials like 'RR', or common nickname), and you can confidently associate this figure primarily with one of the political parties in the provided list, you **MUST select that specific party** as the 'primary_target_entity'. For example, if the comment says 'RR' and you identify 'RR' as Rafizi Ramli who is a key figure in 'Parti Keadilan Rakyat (PKR)', and 'Parti Keadilan Rakyat (PKR)' is in your target list, then 'primary_target_entity' must be 'Parti Keadilan Rakyat (PKR)'. Your 'entity_identification_reasoning' should explain this mapping. " # MODIFIED/ADDED
+        
+        "    - Only if the comment expresses a very general sentiment not directed at any single listed entity (or individuals clearly representing them as per the rule above), OR if it targets an individual or group whose primary party affiliation from the list is genuinely unclear or not represented in your provided list, should you use 'General Comment/No Specific Listed Entity'. " # MODIFIED
+        
+        "    - Provide your 'entity_identification_reasoning' for this choice, clearly justifying how you arrived at the entity, including any individual-to-party mappings. "
+        "3.  **Determine Sentiment Towards Target**: "
+        "    - Classify the 'sentiment_expressed' towards the identified 'primary_target_entity'. This sentiment MUST be one of: 'positive', 'negative', or 'neutral'. "
+        "    - Assign a precise 'sentiment_score' from -1.0 (very negative) to 1.0 (very positive), with 0.0 being strictly neutral. This score is critical and must reflect the INTENSITY and NUANCE of the sentiment. "
+        "      Consider the following detailed rubric for the MAGNITUDE of the score: "
+        "        - **+/- 0.9 to +/- 1.0 (Extreme)**: Expresses overt hatred, adoration, calls for extreme action, or uses exceptionally aggressive/laudatory language. Often highly emotional. "
+        "        - **+/- 0.7 to +/- 0.89 (Very Strong)**: Clearly and forcefully expresses strong approval/disapproval, contempt, or enthusiasm. Uses strong emotive words. "
+        "        - **+/- 0.4 to +/- 0.69 (Strong)**: Expresses clear positive/negative sentiment beyond a simple statement of opinion. Shows conviction. E.g., 'This is a terrible policy.' "
+        "        - **+/- 0.1 to +/- 0.39 (Moderate/Mild)**: Expresses a noticeable but not forceful sentiment. May include mild criticism, some praise, or slight leanings. E.g., 'I'm not too fond of this idea.' "
+        "        - **0.0 (Strictly Neutral)**: No discernible sentiment, purely factual, or perfectly balanced with clear pro/con equally weighted. "
+        "    - **Sarcasm Impact**: If sarcasm is detected, the 'sentiment_expressed' and 'sentiment_score' MUST reflect the true, underlying sarcastic meaning and its intensity towards the target. Explicitly detail this inversion in the reasoning. "
+        "4.  **Detailed Score Justification ('sentiment_score_reasoning')**: THIS IS A CRITICAL FIELD. Provide a comprehensive, step-by-step explanation for how the 'sentiment_score' was derived. "
+        "    - Identify specific keywords, phrases, idioms, or linguistic cues in the comment that contribute to the sentiment. "
+        "    - Analyze the emotional tone and intensity conveyed by these cues. "
+        "    - Explain how the chosen score magnitude (e.g., -0.7 vs. -0.3) is justified based on the rubric and the comment's content. "
+        "    - If sarcasm is present, detail how it inverts or alters the apparent sentiment and how this affected the final score. "
+        "    - If the comment is ambiguous or complex, acknowledge this in your reasoning. "
+        "5.  **Estimate Confidence ('sentiment_confidence')**: Provide a 'sentiment_confidence' score from 0.0 (very low confidence) to 1.0 (very high confidence) for your overall sentiment_expressed and sentiment_score assessment. "
+        "    - High confidence (0.9-1.0): Clear, unambiguous sentiment, direct language. "
+        "    - Medium confidence (0.6-0.89): Sentiment is fairly clear, but some minor ambiguity or subtlety might exist. "
+        "    - Low confidence (0.0-0.59): Sentiment is very ambiguous, highly dependent on obscure context, extremely subtle, or the comment is poorly written/fragmented. If confidence is below 0.7, briefly explain why in the 'sentiment_score_reasoning'. "
         "Your response MUST be a single, valid JSON object, and NOTHING ELSE. Do not add any explanatory text before or after the JSON. "
-        f"The JSON object must strictly adhere to this Pydantic schema: {escaped_targeted_sentiment_schema}"
+        f"The JSON object must strictly adhere to this Pydantic schema, including all fields: {escaped_targeted_sentiment_schema}"
     )
-    human_prompt = (
+
+    human_prompt_template = ( # Renamed for clarity
         "Video Title: {video_title}\n"
         "Video Description: {video_description}\n"
         "Contextual Summary of Video: {contextual_summary}\n\n"
@@ -680,137 +796,159 @@ def analyze_comment_sentiment_analysis_langchain(comment, contextual_summary, vi
         "YouTube Comment:\n\"\"\"\n{comment_text}\n\"\"\"\n\n"
         "Targeted Sentiment Analysis (JSON Object):"
     )
-    prompt_template = ChatPromptTemplate.from_messages([("system", system_prompt), ("human", human_prompt)])
-    chain_llm_part = prompt_template | llm | JsonOutputParser(pydantic_object=TargetedCommentSentiment)
 
-    comment_text_to_analyze = comment.get('comment_text', "") # Ensure this is defined
-    # Define default_error_output specific to this function's Pydantic model
-    default_error_output = {
+    prompt = ChatPromptTemplate.from_messages([("system", system_prompt), ("human", human_prompt_template)])
+    
+    # Specify the model you are using, e.g., the Qwen model or another
+    llm = ChatFireworks(
+        model="accounts/fireworks/models/qwen3-235b-a22b", # Or your preferred model
+        fireworks_api_key=fireworks_api_key_to_use,
+        temperature=0.05, # Lower temperature for more deterministic and structured output
+        max_tokens=16384 # Increased slightly for potentially longer reasoning
+    )
+
+    # Define the chain to output a string first
+    chain_to_str_output = prompt | llm | StrOutputParser()
+    # Define the Pydantic-specific JSON parser
+    pydantic_json_parser = JsonOutputParser(pydantic_object=TargetedCommentSentiment)
+
+    comment_text_to_analyze = comment.get('comment_text', "")
+    
+    # Default error structure matching TargetedCommentSentiment
+    default_error_payload = {
         "comment_text": comment_text_to_analyze, "is_sarcastic": False, "sarcasm_reasoning": "N/A - Analysis error",
         "primary_target_entity": "General Comment/No Specific Listed Entity",
         "entity_identification_reasoning": "N/A - Error during analysis.",
         "sentiment_expressed": "neutral", "sentiment_score": 0.0,
-        "overall_reasoning": "Could not perform targeted sentiment analysis due to an error."
+        "sentiment_score_reasoning": "Could not perform targeted sentiment analysis due to an error.",
+        "sentiment_confidence": 0.0
     }
-    if not comment_text_to_analyze.strip(): # Handle empty comments earlier
-        empty_comment_output = default_error_output.copy()
-        empty_comment_output["comment_text"] = "" # Override if it was None
-        empty_comment_output["sarcasm_reasoning"] = "N/A - Comment was empty."
-        empty_comment_output["entity_identification_reasoning"] = "Comment was empty."
-        empty_comment_output["overall_reasoning"] = "Comment was empty or whitespace only."
-        return empty_comment_output
 
-    raw_llm_output_for_debug = ""
+    if not comment_text_to_analyze.strip():
+        empty_comment_payload = default_error_payload.copy()
+        empty_comment_payload["comment_text"] = ""
+        empty_comment_payload["sarcasm_reasoning"] = "N/A - Comment was empty."
+        empty_comment_payload["entity_identification_reasoning"] = "Comment was empty."
+        empty_comment_payload["sentiment_score_reasoning"] = "Comment was empty or whitespace only."
+        return empty_comment_payload
+
+    raw_llm_string_for_debug = ""
     try:
-        parsed_output = chain_llm_part.invoke({
+        # 1. Get raw string output from LLM
+        raw_llm_string = chain_to_str_output.invoke({
             "video_title": video_title or "N/A",
-            "video_description": (video_description or "N/A")[:1000],
+            "video_description": (video_description or "N/A")[:1000], # Limit length
             "contextual_summary": contextual_summary or "N/A",
             "comment_text": comment_text_to_analyze
         })
+        raw_llm_string_for_debug = raw_llm_string
 
-        result_dict = None # Initialize
+        # 2. Clean the raw string output (ensure clean_llm_json_output is defined in your script)
+        cleaned_json_string = clean_llm_json_output(raw_llm_string)
 
-        if isinstance(parsed_output, dict):
-            result_dict = parsed_output # It's already a dict
-        elif isinstance(parsed_output, TargetedCommentSentiment): # Your Pydantic model
-            if hasattr(parsed_output, 'model_dump'): # Pydantic V2
-                result_dict = parsed_output.model_dump()
-            elif hasattr(parsed_output, 'dict'): # Pydantic V1
-                result_dict = parsed_output.dict()
-            else:
-                print(f"Error: Pydantic model {type(parsed_output)} has no model_dump/dict method.", file=sys.stderr)
-                result_dict = default_error_output.copy()
-                result_dict["overall_reasoning"] = "Pydantic model conversion error"
-        else:
-            print(f"Error: LLM JsonOutputParser returned unexpected type: {type(parsed_output)}", file=sys.stderr)
-            result_dict = default_error_output.copy()
-            result_dict["overall_reasoning"] = f"LLM output parsing error, unexpected type: {type(parsed_output)}"
+        if not cleaned_json_string.strip():
+            print(f"Error: LLM output was empty or invalid after cleaning for comment: '{comment_text_to_analyze[:50]}...'. Raw output was: '{raw_llm_string[:500]}'", file=sys.stderr)
+            error_payload = default_error_payload.copy()
+            error_payload["sentiment_score_reasoning"] = "LLM output empty/invalid after cleaning think tags."
+            return error_payload
+
+        # 3. Parse the cleaned string into the Pydantic model
+        parsed_model_instance = pydantic_json_parser.parse(cleaned_json_string)
         
-        # Ensure the original comment_text is in the final dict
-        result_dict['comment_text'] = comment_text_to_analyze
-        return result_dict
+        result_dict = None
+
+        # 4. Convert Pydantic model instance to dictionary
+        if isinstance(parsed_model_instance, dict): # Fallback, though .parse() should yield model
+            result_dict = parsed_model_instance
+            # print("Warning: JsonOutputParser.parse() returned a dict instead of Pydantic model. Proceeding with dict.", file=sys.stderr)
+        elif isinstance(parsed_model_instance, TargetedCommentSentiment):
+            if hasattr(parsed_model_instance, 'model_dump'): # Pydantic V2
+                result_dict = parsed_model_instance.model_dump()
+            elif hasattr(parsed_model_instance, 'dict'): # Pydantic V1
+                result_dict = parsed_model_instance.dict()
+            else:
+                print(f"Error: Pydantic model {type(parsed_model_instance)} has no model_dump/dict method after parsing.", file=sys.stderr)
+                result_dict = default_error_payload.copy()
+                result_dict["sentiment_score_reasoning"] = "Pydantic model conversion error post-parse"
+        else:
+            print(f"Error: LLM JsonOutputParser.parse() returned unexpected type: {type(parsed_model_instance)} from cleaned string: '{cleaned_json_string[:200]}'", file=sys.stderr)
+            result_dict = default_error_payload.copy()
+            result_dict["sentiment_score_reasoning"] = f"LLM output parsing error, unexpected type post-parse: {type(parsed_model_instance)}"
+
+        # Ensure the original comment_text is in the final dict, and all fields from model are present or defaulted
+        final_payload = default_error_payload.copy() # Start with defaults
+        final_payload.update(result_dict) # Update with parsed values
+        final_payload['comment_text'] = comment_text_to_analyze # Ensure original comment text is accurate
+        
+        return final_payload
 
     except Exception as e:
-        str_parser_for_debug = StrOutputParser()
-        try:
-            raw_llm_output_for_debug = (prompt_template | llm | str_parser_for_debug).invoke({
-                "video_title": video_title or "N/A",
-                "video_description": (video_description or "N/A")[:1000],
-                "contextual_summary": contextual_summary or "N/A",
-                "comment_text": comment_text_to_analyze
-            })
-        except Exception as dbg_e:
-            raw_llm_output_for_debug = f"Could not retrieve raw LLM output for debugging. Debug error: {dbg_e}"
-
-        print(f"Targeted sentiment analysis error for comment '{comment_text_to_analyze[:50]}...'. \nOriginal Error: {e}", file=sys.stderr)
-        print(f"Raw LLM output (if retrievable) that might have caused error:\n---\n{raw_llm_output_for_debug}\n---", file=sys.stderr)
+        print(f"Targeted sentiment analysis processing error for comment '{comment_text_to_analyze[:50]}...'. \nOriginal Error: {e}", file=sys.stderr)
+        print(f"Raw LLM string output (before cleaning) that might have caused error:\n---\n{raw_llm_string_for_debug}\n---", file=sys.stderr)
         
-        error_output_on_exception = default_error_output.copy()
-        error_output_on_exception["sarcasm_reasoning"] = f"LLM Analysis Exception. Raw: {raw_llm_output_for_debug[:100]}"
-        error_output_on_exception["overall_reasoning"] = f"LLM exception during targeted sentiment analysis: {str(e)[:100]}"
-        return error_output_on_exception
+        error_payload_on_exception = default_error_payload.copy()
+        error_payload_on_exception["sentiment_score_reasoning"] = f"LLM processing exception: {str(e)[:150]}. Raw output sample: {raw_llm_string_for_debug[:100]}"
+        return error_payload_on_exception
 
 # --- Modified Function for ASCII Leniency Summary (to return string) ---
-def generate_targeted_sentiment_visual_str(summary_data, max_bar_width=30):
-    output_lines = []
-    output_lines.append("--- Targeted Sentiment Distribution Visual ---")
-
+def generate_sentiment_plot_image(summary_data, output_dir, filename="overall_sentiment_plot.png"):
+    """
+    Generates a grouped bar chart of sentiment distribution per entity and saves it as a PNG image.
+    """
     if not summary_data or not summary_data.get("by_entity"):
-        output_lines.append("No targeted sentiment data available to generate a visual summary.")
-        return "\n".join(output_lines)
+        print("No targeted sentiment data available to generate a plot.", file=sys.stderr)
+        return None
 
     data_by_entity = summary_data["by_entity"]
-    overall_stats = summary_data.get("overall_stats", {})
     entities_with_comments = {
         entity: data for entity, data in data_by_entity.items() if data.get("comment_count", 0) > 0
     }
 
     if not entities_with_comments:
-        output_lines.append("No comments were found primarily targeting any specific entities for visualization.")
-        output_lines.append(f"(Overall Valid Analyses: {overall_stats.get('valid_analyses',0)})")
-        return "\n".join(output_lines)
+        print("No comments found for any specific entities to plot.", file=sys.stderr)
+        return None
 
-    output_lines.append(f"Overall Valid Analyses: {overall_stats.get('valid_analyses',0)}, "
-                        f"Total Sarcastic Comments: {overall_stats.get('total_sarcastic_comments_overall',0)}")
+    labels = list(entities_with_comments.keys())
+    positive_counts = [entities_with_comments[entity].get("positive", 0) for entity in labels]
+    negative_counts = [entities_with_comments[entity].get("negative", 0) for entity in labels]
+    neutral_counts = [entities_with_comments[entity].get("neutral", 0) for entity in labels]
 
-    sentiment_labels = ["Positive", "Negative", "Neutral"]
-    max_sentiment_label_len = max(len(label) for label in sentiment_labels)
+    x = np.arange(len(labels))  # the label locations
+    width = 0.25  # the width of the bars
 
-    for entity_name, entity_data in entities_with_comments.items():
-        avg_score_display = f"{entity_data['average_sentiment_score']:.2f}" if entity_data['valid_score_count'] > 0 else "N/A"
-        output_lines.append(f"\n{entity_name}: "
-                            f"({entity_data['comment_count']} comments, "
-                            f"{entity_data['sarcastic_count']} sarcastic, "
-                            f"Avg Score: {avg_score_display})")
+    fig, ax = plt.subplots(figsize=(12, 7)) # Adjust figsize as needed for readability
 
-        sentiments_to_display = {
-            "Positive": entity_data.get("positive", 0),
-            "Negative": entity_data.get("negative", 0),
-            "Neutral":  entity_data.get("neutral", 0)
-        }
-        total_classified_for_entity = sum(sentiments_to_display.values())
-        if total_classified_for_entity == 0:
-            output_lines.append("    No classified sentiments (positive/negative/neutral) for this entity.")
-            continue
+    rects1 = ax.bar(x - width, positive_counts, width, label='Positive', color='forestgreen')
+    rects2 = ax.bar(x, neutral_counts, width, label='Neutral', color='cornflowerblue')
+    rects3 = ax.bar(x + width, negative_counts, width, label='Negative', color='orangered')
 
-        max_count_for_entity_bar_scaling = max(c for c in sentiments_to_display.values() if isinstance(c, int) and c > 0) if \
-                                           any(c > 0 for c in sentiments_to_display.values() if isinstance(c,int)) else 1 # Avoid div by zero
-        
-        line_len = max_sentiment_label_len + 3 + max_bar_width + 3 + 5 + 10 
-        output_lines.append("  " + "-" * line_len)
+    # Add some text for labels, title and custom x-axis tick labels, etc.
+    ax.set_ylabel('Number of Comments')
+    ax.set_title('Overall Sentiment Distribution by Targeted Entity')
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=9) # Rotate labels for readability
+    ax.legend(title="Sentiment")
 
-        for sentiment_label, count_val in sentiments_to_display.items():
-            percentage = (count_val / total_classified_for_entity * 100) if total_classified_for_entity > 0 else 0.0
-            bar_length = int((count_val / max_count_for_entity_bar_scaling) * max_bar_width) if max_count_for_entity_bar_scaling > 0 else 0
-            bar_char = '█'
-            bar = bar_char * bar_length
-            padding = ' ' * (max_bar_width - bar_length)
-            output_lines.append(f"  {sentiment_label:<{max_sentiment_label_len}} [{bar}{padding}] {count_val:>4} ({percentage:>5.1f}%)")
-        output_lines.append("  " + "-" * line_len)
-        
-    output_lines.append("\n--- End of Visual Summary ---")
-    return "\n".join(output_lines)
+    # Ensure y-axis shows integers if counts are always integers
+    ax.yaxis.set_major_locator(mticker.MaxNLocator(integer=True))
+
+    ax.bar_label(rects1, padding=3, fontsize=8)
+    ax.bar_label(rects2, padding=3, fontsize=8)
+    ax.bar_label(rects3, padding=3, fontsize=8)
+
+    fig.tight_layout() # Adjust layout to make room for labels
+
+    plot_path = os.path.join(output_dir, filename)
+    try:
+        plt.savefig(plot_path)
+        print(f"Sentiment plot saved to: {os.path.abspath(plot_path)}", file=sys.stderr)
+        plt.close(fig) # Close the figure to free memory
+        return plot_path
+    except Exception as e:
+        print(f"Error saving sentiment plot: {e}", file=sys.stderr)
+        plt.close(fig)
+        return None
+
 
 
 # --- Main Orchestration Logic ---
@@ -1005,10 +1143,16 @@ def main():
                 grand_total_analyzed_comments_data, 
                 title="Grand Total (All Selected Videos) Targeted Sentiment"
             )
+            
             save_data_to_file(targeted_sentiment_summary_dict, args.output_dir, "overall_sentiment_summary.json")
             
-            visual_summary_content = generate_targeted_sentiment_visual_str(targeted_sentiment_summary_dict)
-            save_data_to_file(visual_summary_content, args.output_dir, "overall_sentiment_visual.txt")
+            if targeted_sentiment_summary_dict: # Ensure there's data
+                generate_sentiment_plot_image(targeted_sentiment_summary_dict, args.output_dir)
+            # If no data, the plot function will print a message and do nothing.
+            else:
+                print("\nNo comments were analyzed across all selected videos, so no overall summary files generated.", file=sys.stderr)
+            # You might still want to create an empty JSON summary, but no plot if no data.
+                save_data_to_file({"by_entity":{}, "overall_stats":{"total_analyzed_items":0, "valid_analyses":0, "total_sarcastic_comments_overall":0}}, args.output_dir, "overall_sentiment_summary.json")
         else:
             print("\nNo comments were analyzed across all selected videos, so no overall targeted sentiment summary to display or save.", file=sys.stderr)
             # Create empty summary files as GUI might expect them
