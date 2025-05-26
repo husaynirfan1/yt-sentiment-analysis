@@ -1,5 +1,5 @@
 # yt-sentiment-analysis
-A YT comment sentiment analysis using AI Agent. Build as core for getting sentiment overview for Malaysian Political Coalition.
+A YT comment sentiment analysis using LLM. Build as core for getting sentiment overview for Malaysian Political Coalition.
 
 ### Core stack:
 - Langchain
