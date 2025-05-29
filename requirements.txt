@@ -1,0 +1,11 @@
+yt-dlp
+python-dotenv
+google-api-python-client
+matplotlib
+numpy
+langchain-fireworks
+langchain-core
+pydantic
+openai
+customtkinter
+Pillow
