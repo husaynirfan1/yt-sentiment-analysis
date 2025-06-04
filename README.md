@@ -7,6 +7,11 @@ The project consists of two main components:
 *   `gui_app.py`: A user-friendly graphical interface for managing inputs (such as YouTube video URLs), initiating the sentiment analysis process, and viewing the summarized results.
 *   `scraper_v2.py`: A powerful backend script responsible for fetching YouTube comment data, utilizing AI models for filtering relevant comments and performing sentiment analysis, and generating detailed output reports.
 
+
+# Demo
+
+https://github.com/user-attachments/assets/3f6d7fd2-c67b-44eb-8538-7f8f6732b394
+
 ### Features:
 *   **User-Friendly Interface:** A GUI (`gui_app.py`) for easy interaction, input management, and results visualization.
 *   **Targeted Video Fetching:** Retrieves videos from a specified YouTube channel.
@@ -308,7 +313,7 @@ This section provides a high-level look at the main Python scripts in the projec
 *   **Execution:**
     *   Can be run independently from the command line (CLI) for automated or scripted tasks.
     *   Is also executed as a subprocess by `gui_app.py` to perform actions initiated from the user interface.
-*   **Key Functional Stages (Conceptual Agents/Modules):**
+*   **Key Functional Stages :**
     *   **`agent0_fetch_and_filter_videos`:**
         *   Fetches a list of recent videos from the specified YouTube channel using the YouTube Data API.
         *   Utilizes a Large Language Model (LLM) via Fireworks AI to filter these videos, identifying those relevant to Malaysian politics based on their titles and descriptions.
