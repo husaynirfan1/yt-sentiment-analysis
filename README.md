@@ -7,10 +7,85 @@ The project consists of two main components:
 *   `gui_app.py`: A user-friendly graphical interface for managing inputs (such as YouTube video URLs), initiating the sentiment analysis process, and viewing the summarized results.
 *   `scraper_v2.py`: A powerful backend script responsible for fetching YouTube comment data, utilizing AI models for filtering relevant comments and performing sentiment analysis, and generating detailed output reports.
 
-
 # Demo
 
 https://github.com/user-attachments/assets/3f6d7fd2-c67b-44eb-8538-7f8f6732b394
+
+# Output example
+
+<details>
+<summary>targetted_sentiment_analysis.json</summary>
+
+```json
+ {
+        "comment_text": "Why are they there really?",
+        "is_sarcastic": true,
+        "sarcasm_reasoning": "The rhetorical question implies skepticism toward the official explanation, suggesting hidden motives.",
+        "primary_target_entity": "United Malays National Organisation (UMNO)",
+        "entity_identification_reasoning": "The comment questions the presence of 'they,' referring to the UMNO leaders explicitly mentioned in the video context.",
+        "sentiment_expressed": "negative",
+        "sentiment_score": -0.7,
+        "sentiment_score_reasoning": "The sarcastic phrasing directly challenges the credibility of the UMNO leaders' stated reasons for their presence, implying deceit. The rhetorical question carries strong negative connotations (-0.7) by framing the situation as suspicious. Sarcasm inverts the literal neutrality of a question into a critical stance. Confidence is high (0.95) due to clear contextual linkage to UMNO and overt skepticism in the phrasing.",
+        "sentiment_confidence": 0.95,
+        "overall_reasoning": "The sarcastic question undermines the official narrative about UMNO leaders' trip, projecting negative sentiment toward UMNO by implying dishonesty about their motives."
+    },
+    {
+        "comment_text": "Any proof they paid their own. Rubbish. All spend rakyat’s money and call us kafir. No good lah😢",
+        "is_sarcastic": false,
+        "sarcasm_reasoning": "N/A",
+        "primary_target_entity": "United Malays National Organisation (UMNO)",
+        "entity_identification_reasoning": "The comment directly accuses 'they' (UMNO leaders mentioned in the video) of misusing public funds, referencing Zahid Hamidi's party (UMNO) and their alleged hypocrisy. The phrase 'call us kafir' ties to UMNO-linked figures' history of using religious rhetoric against critics.",
+        "sentiment_expressed": "negative",
+        "sentiment_score": -0.8,
+        "sentiment_score_reasoning": "The comment uses strong negative language ('Rubbish', 'All spend rakyat’s money') to accuse UMNO of corruption and hypocrisy. The phrase 'call us kafir' criticizes their moral authority, while 'No good lah' reinforces disapproval. The tone is forceful but not extreme (no explicit threats), warranting -0.8. Context about UMNO's political role in the video strengthens the targeted criticism.",
+        "sentiment_confidence": 0.95,
+        "overall_reasoning": "The comment explicitly targets UMNO's alleged misuse of public funds and religious rhetoric, expressing clear negative sentiment through direct accusations and emotive language. No sarcasm detected."
+    },
+```
+</details>
+<details>
+<summary>overall_sentiment_summary.json</summary>
+
+```json
+ "Parti Amanah Negara (AMANAH)": {
+            "positive": 0,
+            "negative": 0,
+            "neutral": 0,
+            "sarcastic_count": 0,
+            "sum_sentiment_score": 0.0,
+            "valid_score_count": 0,
+            "comment_count": 0,
+            "average_sentiment_score": 0.0
+        },
+        "United Malays National Organisation (UMNO)": {
+            "positive": 0,
+            "negative": 7,
+            "neutral": 0,
+            "sarcastic_count": 6,
+            "sum_sentiment_score": -5.2,
+            "valid_score_count": 7,
+            "comment_count": 7,
+            "average_sentiment_score": -0.7428571428571429
+        },
+        "Malaysian Islamic Party (PAS)": {
+            "positive": 0,
+            "negative": 0,
+            "neutral": 0,
+            "sarcastic_count": 0,
+            "sum_sentiment_score": 0.0,
+            "valid_score_count": 0,
+            "comment_count": 0,
+            "average_sentiment_score": 0.0
+        },
+```
+</details>
+<details>
+<summary>overall_sentiment_plot.png</summary>
+
+![overall_sentiment_plot](https://github.com/user-attachments/assets/5a476814-bb55-4cbf-9974-ed1477e1243f)
+
+</details>
+
 
 ### Features:
 *   **User-Friendly Interface:** A GUI (`gui_app.py`) for easy interaction, input management, and results visualization.
